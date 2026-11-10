@@ -1,0 +1,11 @@
+node_modules/
+/.local-backups/
+.next/
+.env*
+!.env.example
+*.tsbuildinfo
+next-env.d.ts
+
+.next-smoke/
+
+.local-documents/

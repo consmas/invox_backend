@@ -1,0 +1,43 @@
+{
+  "name": "invoix-backend",
+  "version": "1.0.0",
+  "private": true,
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "dev": "next dev --hostname 127.0.0.1 --port 3001",
+    "build": "next build",
+    "start": "next start --port 3001",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "test": "tsx --test tests/*.test.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "db:seed-admin": "tsx scripts/seed-admin.ts",
+    "db:cleanup": "tsx scripts/cleanup.ts",
+    "test:http": "node tests/http-smoke.mjs"
+  },
+  "dependencies": {
+    "@next/env": "15.5.29",
+    "bcryptjs": "^3.0.2",
+    "next": "15.5.29",
+    "nodemailer": "^10.4.0",
+    "pg": "^8.16.0",
+    "react": "19.3.1",
+    "react-dom": "19.3.1",
+    "zod": "^4.0.0"
+  },
+  "devDependencies": {
+    "@eslint/eslintrc": "^3",
+    "@types/node": "^22",
+    "@types/nodemailer": "^8.0.2",
+    "@types/pg": "^8",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "eslint": "^9",
+    "eslint-config-next": "15.5.29",
+    "tsx": "^4",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  }
+}

@@ -1,0 +1,11 @@
+import { loadEnvConfig } from '@next/env';
+import { closePool, rows } from '../src/server/db';
+
+loadEnvConfig(process.cwd());
+async function cleanup() {
+  await rows('DELETE FROM app_sessions WHERE expires_at < now()');
+  await rows("DELETE FROM auth_rate_limits WHERE window_start < now()-interval '1 day'");
+  await rows("UPDATE bids SET status=3,updated_at=now() WHERE status=0 AND expiry_date<current_date");
+  console.log('Expired sessions, rate limits, and bids cleaned up');
+}
+cleanup().catch(error => { console.error(error.message); process.exitCode=1; }).finally(closePool);

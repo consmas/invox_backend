@@ -56,6 +56,7 @@ function invoiceAccess(actor: Actor, invoice: Row, write = false) {
 async function invoiceFor(actor: Actor, invoiceId: string, buyerId: string | undefined, db: DB, write = false): Promise<Row> {
   const record = found((await rows(`${invoiceSelect} WHERE i.id=$1`, [invoiceId], db))[0]);
   record.has_own_bid = (await rows('SELECT EXISTS(SELECT 1 FROM bids WHERE invoice_id=$1 AND financer_id=$2) AS own', [invoiceId, actor.id], db))[0].own;
+  requireCondition(!record.deleted_at,404,'Invoice not found');
   if (buyerId) requireCondition(same(record.buyer_id, buyerId), 404, 'Not found');
   invoiceAccess(actor, record, write);
   if(actor.role==='financer'){const tenders=await rows('SELECT t.id FROM financing_tenders t WHERE t.invoice_id=$1',[invoiceId],db);if(tenders.length)requireCondition((await rows('SELECT 1 FROM portal_tender_invitations WHERE tender_id=ANY($1::bigint[]) AND financer_id=$2',[tenders.map(t=>t.id),actor.id],db)).length,403,'This tender is invitation only');}
@@ -70,9 +71,10 @@ function invoiceFilter(actor: Actor, values: unknown[]): string {
   if (actor.role === 'supplier_user') return `s.user_id=${user}`;
   return `(i.status='tender' OR EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND d.financer_id=${user}))`;
 }
-async function invoiceList(actor: Actor, buyerId?: string, programmeId?: string, db: DB = pool()) {
+export async function invoiceList(actor: Actor, buyerId?: string, programmeId?: string, db: DB = pool(), includeDeleted=false) {
   const values: unknown[] = [];
   const where = [invoiceFilter(actor, values)];
+  if(!includeDeleted)where.push('i.deleted_at IS NULL');
   if (buyerId) { await buyerFor(actor, buyerId, db); values.push(buyerId); where.push(`p.buyer_id=$${values.length}`); }
   if (programmeId) { await programmeFor(actor, programmeId, buyerId, db); values.push(programmeId); where.push(`i.programme_id=$${values.length}`); }
   if(actor.role==='financer'){values.push(actor.id);where.push(`(NOT EXISTS(SELECT 1 FROM financing_tenders t WHERE t.invoice_id=i.id) OR EXISTS(SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=i.id AND ti.financer_id=$${values.length}))`);}
@@ -179,6 +181,7 @@ async function buyers(actor: Actor, method: string, buyerId: string | undefined,
 
 async function programmes(actor: Actor, method: string, buyerId: string | undefined, programmeId: string | undefined, body: Input): Promise<Result> {
   return transaction(async db => {
+    if(programmeId&&method!=='GET')await rows('SELECT id FROM programmes WHERE id=$1 FOR UPDATE',[programmeId],db);
     if (buyerId) await buyerFor(actor, buyerId, db);
     const previous = programmeId ? await programmeFor(actor, programmeId, buyerId, db) : undefined;
     if (method === 'GET') {
@@ -194,19 +197,21 @@ async function programmes(actor: Actor, method: string, buyerId: string | undefi
       rejectManagedFields('programmes',input);
       const data=coreSchema('programmes').parse(input);
       await validateFieldReferences('programmes',data,actor,db);
-      const record=await insert('programmes', {...databaseValues('programmes',data),buyer_id:target},db);
+      const record=await insert('programmes', {...databaseValues('programmes',data),buyer_id:target,status:'draft',created_by:actor.id,configured_by:actor.id},db);
       await entityAudit(db,actor,'programmes',String(record.id),'created',null,record);
       return {data:record,status:201};
     }
     requireCondition(programmeId && previous, 405, 'Method not allowed');
     if (method === 'PATCH' || method === 'PUT') {
+      requireCondition(!previous.archived_at&&(!previous.status||['draft','paused'].includes(previous.status)),409,'Pause the programme before editing released terms; submitted configurations are locked');
       const input=payload(body,'programme');rejectManagedFields('programmes',input);
       const data=coreSchema('programmes',true).parse(input);await validateFieldReferences('programmes',data,actor,db);
       requireCondition(!(await rows("SELECT id FROM invoices WHERE programme_id=$1 AND status IN ('tender','funded','repaid') LIMIT 1",[programmeId],db)).length,409,'Economic programme terms are locked while financing obligations are active');
-      const record=await update('programmes',programmeId,databaseValues('programmes',data),db);
+      const record=await update('programmes',programmeId,{...databaseValues('programmes',data),configured_by:actor.id},db);
       await entityAudit(db,actor,'programmes',programmeId,'updated',previous,record);return {data:record};
     }
     if (method === 'DELETE') {
+      requireCondition(!previous.archived_at&&(!previous.status||previous.status==='draft'),409,'Archive released programmes to preserve their history');
       requireCondition(!(await rows('SELECT id FROM invoices WHERE programme_id=$1 LIMIT 1', [programmeId], db)).length, 409, 'Delete this programme’s invoices first');
       await rows('DELETE FROM programmes WHERE id=$1', [programmeId], db);
       return { status: 204 };
@@ -239,11 +244,13 @@ async function invoices(actor: Actor, method: string, buyerId: string | undefine
     if (method === 'DELETE') {
       requireCondition(!['funded', 'repaid'].includes(previous.status), 409, 'Funded invoices cannot be deleted');
       requireCondition(!(await rows('SELECT id FROM bids WHERE invoice_id=$1 AND status=1',[invoiceId],db)).length,409,'An accepted offer cannot be deleted');
-      await rows('DELETE FROM bids WHERE invoice_id=$1', [invoiceId], db);
-      await rows('DELETE FROM invoices WHERE id=$1', [invoiceId], db);
+      requireCondition(!['pending','approved'].includes(previous.invoice_approval_status),409,'Withdraw the submission before deleting this invoice');
+      requireCondition(!(await rows('SELECT id FROM bids WHERE invoice_id=$1 LIMIT 1',[invoiceId],db)).length,409,'Invoices with offer history cannot be deleted');
+      await rows('UPDATE invoices SET deleted_at=now(),updated_at=now() WHERE id=$1', [invoiceId], db);
       return { status: 204 };
     }
     if (method === 'PATCH' || method === 'PUT') {
+      requireCondition(!['pending','approved'].includes(previous.invoice_approval_status),409,'Withdraw the submission or approval before changing invoice terms');
       const input=payload(body,'invoice');rejectManagedFields('invoices',input);
       const data=coreSchema('invoices',true).parse(input);
       validateInvoiceFields({...previous,...data});await validateFieldReferences('invoices',data,actor,db);

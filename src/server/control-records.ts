@@ -9,7 +9,7 @@ export async function definitions(actor:Actor,path:string[]){
   if(path.length===1)return {data:Object.values(fieldCatalog).filter(entity=>entity.core||actor.role==='platform_ops')};
   requireCondition(path.length===2&&fieldCatalog[path[1]],404,'Unknown field definition');
   const definition=fieldCatalog[path[1]];
-  if(!definition.core)requireRole(actor,'platform_ops');
+  if(!definition.core){const allowed:Record<string,string[]>={financing_requests:['buyer_admin','supplier_user'],mandate_versions:['financer'],conditions_precedent:['buyer_admin']};requireCondition(actor.role==='platform_ops'||allowed[definition.key]?.includes(actor.role),403,'This field definition is unavailable for your role');}
   return {data:definition};
 }
 export async function lookup(actor:Actor,entity:string){
@@ -41,6 +41,7 @@ export async function controlRecords(actor:Actor,method:string,path:string[],bod
     const data=fieldSchema(entity,!!recordId).strict().parse(input);
     await validateFieldReferences(entity,{...previous,...data},actor,db);
     const encoded=databaseValues(entity,data);
+    if(['mandate_versions','limits','conditions_precedent','financing_requests','reconciliation_cases'].includes(entity))encoded.last_modified_by=actor.id;
     const keys=Object.keys(encoded);
     if(!recordId){encoded.created_by=actor.id;keys.push('created_by');}
     requireCondition(keys.length>0,422,'No editable fields were supplied');

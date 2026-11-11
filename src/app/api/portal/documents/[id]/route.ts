@@ -6,7 +6,7 @@ import {rows} from '@/server/db';
 import {resourceRequest} from '@/server/resources';
 export const runtime='nodejs';
 export async function GET(req:NextRequest,{params}:{params:Promise<{id:string}>}){
- try{const actor=await authenticate(req);const {id}=await params;if(!/^\d+$/.test(id))return new NextResponse(null,{status:404});const [doc]=await rows('SELECT * FROM documents WHERE id=$1',[id]);if(!doc)return new NextResponse(null,{status:404});
+ try{const actor=await authenticate(req);const {id}=await params;if(!/^\d+$/.test(id))return new NextResponse(null,{status:404});const [doc]=await rows('SELECT * FROM documents WHERE id=$1',[id]);if(!doc||doc.archived_at)return new NextResponse(null,{status:404});
  let allowed=actor.role==='platform_ops'||String(doc.uploaded_by)===actor.id||actor.role==='buyer_admin'&&String(doc.buyer_id)===actor.buyer_id;
  if(!allowed&&doc.invoice_id){try{await resourceRequest(actor,'GET',['invoices',String(doc.invoice_id)]);allowed=true;}catch{}}
  if(!allowed){const invoices=await rows("SELECT id FROM invoices WHERE supporting_documents @> $1::jsonb",[JSON.stringify([{document_id:String(doc.id)}])]);for(const invoice of invoices){try{await resourceRequest(actor,'GET',['invoices',String(invoice.id)]);allowed=true;break;}catch{}}}

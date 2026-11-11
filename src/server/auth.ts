@@ -23,7 +23,7 @@ export async function actorForToken(token?: string): Promise<Actor | null> {
   if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
   const [user] = await rows(`SELECT u.* FROM app_sessions s JOIN users u ON u.id=s.user_id
     WHERE s.token_hash=$1 AND s.expires_at>now() AND s.user_jti=u.jti`, [digest(token)]);
-  return user ? publicUser(user) : null;
+  return user && !user.disabled_at ? publicUser(user) : null;
 }
 export async function authenticate(req: NextRequest): Promise<Actor> {
   const user = await actorForToken(requestToken(req));
@@ -34,6 +34,10 @@ export function requireRole(actor: Actor, ...allowed: Role[]) {
   requireCondition(allowed.includes(actor.role), 403, 'Forbidden');
 }
 export async function createSession(user: Row, db: DB): Promise<string> {
+  const [current]=await rows('SELECT disabled_at FROM users WHERE id=$1 FOR UPDATE',[user.id],db);
+  requireCondition(current&&!current.disabled_at,403,'Account access is disabled');
+  const archived=await rows('SELECT 1 FROM users u LEFT JOIN buyers b ON b.id=u.buyer_id LEFT JOIN suppliers s ON s.user_id=u.id LEFT JOIN financier_profiles f ON f.user_id=u.id WHERE u.id=$1 AND (b.archived_at IS NOT NULL OR s.archived_at IS NOT NULL OR f.archived_at IS NOT NULL)',[user.id],db);
+  requireCondition(!archived.length,403,'Organisation is archived');
   const token = newToken();
   await rows(`INSERT INTO app_sessions (token_hash,user_id,user_jti,expires_at) VALUES ($1,$2,$3,now()+interval '2 hours')`, [digest(token), user.id, user.jti], db);
   return token;

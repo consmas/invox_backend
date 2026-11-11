@@ -53,6 +53,16 @@ const roles={admin:operator.cookie,buyer:buyerSession.cookie,supplier:supplierSe
 const sections={admin:['','/organizations','/verification','/operations','/repayments','/audit-log','/platform-settings','/settings','/notifications','/help'],buyer:['','/invoices','/invoices/new','/programmes','/suppliers','/tenders','/repayments','/settings','/notifications','/help'],supplier:['','/approvals','/invoices','/early-payment','/payments','/reports','/settings','/notifications','/help'],financier:['','/marketplace','/bids','/portfolio','/repayments','/analytics','/settings','/notifications','/help']};
 for(const [role,cookie] of Object.entries(roles)){
  for(const suffix of sections[role])await request('GET',`/${role}${suffix}`,undefined,cookie);
+ await request('GET',`/${role}/workflows`,undefined,cookie);
+ const modules=(await request('GET','/api/portal/modules',undefined,cookie)).data;
+ for(const entry of modules){
+  await request('GET',`/${role}/manage/${entry.key}`,undefined,cookie);
+  await request('GET',`/api/portal/manage/${entry.key}`,undefined,cookie);
+ }
+ if(role==='buyer'){
+  await request('GET',`/${role}/manage/programmes/new`,undefined,cookie);
+  await request('GET',`/${role}/manage/invoices/${invoice.id}`,undefined,cookie);
+ }
  for(const other of Object.keys(roles).filter(other=>other!==role))await request('GET',`/${other}`,undefined,cookie,404);
  const bootstrap=(await request('GET','/api/portal/bootstrap',undefined,cookie)).data;
  assert.ok(!JSON.stringify(bootstrap).includes('encrypted_password'));assert.ok(!JSON.stringify(bootstrap).includes('mfa_secret_encrypted'));

@@ -3,7 +3,8 @@ import { readFile, readdir } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { closePool, rows, transaction } from '../src/server/db';
 
-loadEnvConfig(process.cwd());
+// Load .env.production only when NODE_ENV=production; local runs use .env.local / .env.development.
+loadEnvConfig(process.cwd(), process.env.NODE_ENV !== 'production');
 async function migrate() {
   await transaction(async db => {
     await db.query('SELECT pg_advisory_xact_lock(72482901)');

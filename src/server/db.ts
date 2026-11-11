@@ -4,15 +4,32 @@ types.setTypeParser(1082, value => value);
 
 const globalDb = globalThis as unknown as { invoixPool?: Pool };
 
+// Accepts the PEM pasted directly or with escaped newlines, as hosting dashboards often store it.
+function caCertificate(raw: string): string {
+  const pem = raw.trim().replace(/^DATABASE_CA_CERT=/, '').replace(/^["']|["']$/g, '').replace(/\\n/g, '\n');
+  if (!pem.includes('-----BEGIN CERTIFICATE-----')) throw new Error('DATABASE_CA_CERT must contain a PEM certificate');
+  return pem;
+}
+
+// DATABASE_CA_CERT (PEM contents) suits platforms without a writable cert file; pg lets
+// connection-string ssl params override the ssl option, so they are removed when it is set.
+function connectionConfig(url: string) {
+  const ca = process.env.DATABASE_CA_CERT;
+  if (!ca) return { connectionString: url };
+  const parsed = new URL(url);
+  for (const key of ['ssl', 'sslmode', 'sslrootcert', 'sslcert', 'sslkey']) parsed.searchParams.delete(key);
+  return { connectionString: parsed.toString(), ssl: { ca: caCertificate(ca), rejectUnauthorized: true } };
+}
+
 export function pool(): Pool {
   if (!globalDb.invoixPool) {
     if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required');
     globalDb.invoixPool = new Pool({
-      connectionString: process.env.DATABASE_URL,
+      ...connectionConfig(process.env.DATABASE_URL),
       max: 10,
       connectionTimeoutMillis: 5000,
       idleTimeoutMillis: 30000,
-      // Use sslmode=verify-full and sslrootcert in DATABASE_URL for remote databases.
+      // Remote databases: set DATABASE_CA_CERT, or sslmode=verify-full&sslrootcert=<file path> in DATABASE_URL.
     });
     globalDb.invoixPool.on('error', error => console.error('PostgreSQL pool error', error.message));
   }

@@ -53,7 +53,7 @@ before(async()=>{
   process.env.DOCUMENT_STORAGE_PATH=await mkdtemp(join(tmpdir(),'invox-upload-test-'));
   process.env.MFA_SECRET_KEY='a'.repeat(64);
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
+  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
   const password=await bcrypt.hash('legacy-secret',4);
   // $2a$ is the bcrypt prefix used by existing Devise accounts.
   const legacy=password.replace('$2b$','$2a$');
@@ -66,6 +66,9 @@ before(async()=>{
     fixture.supplier=await insert('suppliers',{name:'Supplier A',email:fixture.supplierUser.email,user_id:fixture.supplierUser.id},db);
     fixture.programme=await insert('programmes',{name:'Working capital',buyer_id:fixture.buyer.id,limit:'100000',fee_percent:'2',maturity_days:30},db);
   });
+  await rows('INSERT INTO portal_programme_financiers VALUES($1,$2)',[fixture.programme.id,fixture.financer.id]);
+  await rows('INSERT INTO portal_programme_suppliers VALUES($1,$2)',[fixture.programme.id,fixture.supplier.id]);
+  await rows('INSERT INTO portal_supplier_relationships(buyer_id,supplier_id) VALUES($1,$2)',[fixture.buyer.id,fixture.supplier.id]);
   for(const name of ['ops','checker','buyerAdmin','otherAdmin','supplierUser','financer','otherFinancer'])await login(name);
 });
 after(async()=>{
@@ -73,6 +76,105 @@ after(async()=>{
   await pool().end();
   await admin.query(`DROP SCHEMA IF EXISTS "${schema}" CASCADE`);
   await admin.end();
+});
+
+test('workflow modules expose scoped full forms and programme release unlocks incomplete invoice drafts',async()=>{
+ const reason={reason:'Reviewed commercial configuration'};
+ await rows("INSERT INTO financier_profiles(user_id,name,country,institution_type) VALUES($1,'Management test institution','GH','bank') ON CONFLICT(user_id) DO NOTHING",[fixture.financer.id]);
+ for(const [name,expected] of [['ops','limits'],['buyerAdmin','conditions_precedent'],['supplierUser','financing_requests'],['financer','mandate_versions']]){
+  const modules=await request('GET','portal/modules',undefined,tokens[name]);assert.equal(modules.status,200);assert.ok(modules.data.some((r:any)=>r.key===expected));
+  assert.equal((await request('GET',`field-definitions/${expected}`,undefined,tokens[name])).status,200);
+ }
+ assert.equal((await request('GET','portal/manage/limits',undefined,tokens.buyerAdmin)).status,403);
+ const data={name:'Managed programme',buyer_id:fixture.buyer.id,limit:'20000.00',fee_percent:'1',maturity_days:3650,currency:'USD',programme_reference:'MANAGED-TEST',governing_law:'Ghana',jurisdiction:'Accra',buyer_acceptance_authority:'buyer',allocation_policy:'deterministic',supplier_ids:[fixture.supplier.id],financier_ids:[fixture.financer.id]};
+ const created=await request('POST','portal/manage/programmes',data,tokens.ops);assert.equal(created.status,201,JSON.stringify(created.data));const programmeId=created.data.id;
+ assert.equal((await request('PATCH',`portal/manage/programmes/${programmeId}`,{description:'Complete commercial configuration'},tokens.otherAdmin)).status,404);
+ assert.equal((await request('PATCH',`portal/manage/programmes/${programmeId}`,{description:'Complete commercial configuration'},tokens.buyerAdmin)).status,200);
+ assert.equal((await request('POST',`portal/manage/programmes/${programmeId}/submit`,reason,tokens.buyerAdmin)).status,200);
+ assert.equal((await request('POST',`portal/manage/programmes/${programmeId}/activate`,reason,tokens.buyerAdmin)).status,409);
+ const activated=await request('POST',`portal/manage/programmes/${programmeId}/activate`,reason,tokens.ops);assert.equal(activated.status,200,JSON.stringify(activated.data));assert.equal(activated.data.status,'active');
+ const draft=await request('POST','portal/manage/invoices',{programme_id:programmeId,supplier_id:fixture.supplier.id,invoice_number:'PARTIAL-DRAFT'},tokens.buyerAdmin);assert.equal(draft.status,201,JSON.stringify(draft.data));assert.equal(draft.data.amount,null);assert.equal(draft.data.currency,'USD');const invoiceId=draft.data.id;
+ assert.equal((await request('POST',`portal/manage/invoices/${invoiceId}/submit`,reason,tokens.buyerAdmin)).status,422);
+ const completed=await request('PATCH',`portal/manage/invoices/${invoiceId}`,{...invoiceFields(),invoice_number:'COMPLETE-DRAFT',currency:'USD',amount:'1000.00'},tokens.buyerAdmin);assert.equal(completed.status,200,JSON.stringify(completed.data));
+ const submitted=await request('POST',`portal/manage/invoices/${invoiceId}/submit`,reason,tokens.buyerAdmin);assert.equal(submitted.status,200,JSON.stringify(submitted.data));
+ assert.equal((await request('PATCH',`portal/manage/invoices/${invoiceId}`,{amount:'900'},tokens.buyerAdmin)).status,409);
+ assert.equal((await request('DELETE',`portal/manage/invoices/${invoiceId}`,undefined,tokens.buyerAdmin)).status,409);
+ assert.equal((await request('POST',`portal/manage/invoices/${invoiceId}/withdraw`,reason,tokens.buyerAdmin)).status,200);
+ assert.equal((await request('DELETE',`portal/manage/invoices/${invoiceId}`,undefined,tokens.buyerAdmin)).status,204);
+ assert.equal((await request('GET',`invoices/${invoiceId}`,undefined,tokens.buyerAdmin)).status,404);
+ assert.ok(!(await request('GET','invoices',undefined,tokens.buyerAdmin)).data.some((i:any)=>i.id===invoiceId));
+ assert.ok((await request('GET',`portal/manage/invoices/${invoiceId}`,undefined,tokens.buyerAdmin)).data._actions.restore);
+ assert.equal((await request('POST',`portal/manage/invoices/${invoiceId}/restore`,reason,tokens.buyerAdmin)).status,200);
+ assert.equal((await request('POST',`portal/manage/invoices/${invoiceId}/submit`,reason,tokens.buyerAdmin)).status,200);
+ assert.equal((await request('POST',`portal/invoices/${invoiceId}/decide`,{decision:'approve'},tokens.supplierUser)).status,200);
+ const paymentRequest=await request('POST','portal/manage/financing_requests',{invoice_id:invoiceId,requested_amount:'700.00'},tokens.supplierUser);assert.equal(paymentRequest.status,201,JSON.stringify(paymentRequest.data));
+ assert.equal((await request('POST',`portal/manage/financing_requests/${paymentRequest.data.id}/submit`,reason,tokens.supplierUser)).status,200);
+ assert.equal((await request('PATCH',`portal/manage/financing_requests/${paymentRequest.data.id}`,{requested_amount:'600'},tokens.supplierUser)).status,409);
+ assert.equal((await request('POST',`portal/manage/financing_requests/${paymentRequest.data.id}/withdraw`,reason,tokens.supplierUser)).status,200);
+ const tender=await request('POST','portal/tenders',{invoice_id:invoiceId,requested_amount:'700',closes_on:'2030-11-01',financier_ids:[fixture.financer.id]},tokens.buyerAdmin);assert.equal(tender.status,201,JSON.stringify(tender.data));
+ const edited=await request('PATCH',`portal/manage/tenders/${tender.data.id}`,{eligible_conditions:'Updated disclosure before any offers'},tokens.buyerAdmin);assert.equal(edited.status,200,JSON.stringify(edited.data));
+ assert.equal((await request('POST',`portal/manage/tenders/${tender.data.id}/cancel`,reason,tokens.buyerAdmin)).status,200);
+ assert.equal((await rows('SELECT status FROM invoices WHERE id=$1',[invoiceId]))[0].status,'approved');
+ const relationshipId=(await rows('SELECT id FROM portal_supplier_relationships WHERE buyer_id=$1 AND supplier_id=$2',[fixture.buyer.id,fixture.supplier.id]))[0].id;
+ const relation=await request('PATCH',`portal/manage/supplier_relationships/${relationshipId}`,{contact_name:'Accounts contact',contact_email:'accounts@example.test',notes:'Relationship notes'},tokens.buyerAdmin);assert.equal(relation.status,200,JSON.stringify(relation.data));assert.equal(relation.data.contact_name,'Accounts contact');
+ const [otherRelationship]=await rows('INSERT INTO portal_supplier_relationships(buyer_id,supplier_id,contact_name) VALUES($1,$2,$3) RETURNING *',[fixture.otherBuyer.id,fixture.supplier.id,'Other buyer contact']);
+ assert.notEqual(otherRelationship.id,relationshipId);
+ assert.equal((await request('PATCH',`portal/manage/supplier_relationships/${otherRelationship.id}`,{contact_name:'Updated other buyer contact'},tokens.ops)).status,200);
+ assert.equal((await rows('SELECT contact_name FROM portal_supplier_relationships WHERE id=$1',[relationshipId]))[0].contact_name,'Accounts contact');
+ assert.equal((await request('PATCH',`portal/manage/supplier_relationships/${otherRelationship.id}`,{contact_name:'Cross buyer edit'},tokens.buyerAdmin)).status,404);
+ assert.equal((await request('POST',`portal/manage/programmes/${programmeId}/pause`,reason,tokens.buyerAdmin)).status,200);
+ const draft2=await request('POST','portal/manage/invoices',{...invoiceFields(),programme_id:programmeId,supplier_id:fixture.supplier.id,currency:'USD',amount:'100'},tokens.buyerAdmin);assert.equal(draft2.status,201,JSON.stringify(draft2.data));
+ assert.equal((await request('POST',`portal/manage/invoices/${draft2.data.id}/submit`,reason,tokens.buyerAdmin)).status,409);
+});
+
+test('mandates and limits require independent release and acknowledgement; reconciliation does not rewrite money',async()=>{
+ const reason={reason:'Independent review completed'};
+ const created=await request('POST','portal/manage/mandate_versions',{name:'Mandate test',permitted_countries:['GH'],permitted_sectors:['Trade'],permitted_currencies:['USD'],minimum_tenor_days:1,maximum_tenor_days:120,facility_limit:'20000.00',plain_language_terms:'Only verified receivables within the agreed trade policy.',effective_from:'2026-01-01'},tokens.financer);assert.equal(created.status,201,JSON.stringify(created.data));const id=created.data.id;
+ assert.equal((await request('GET',`portal/manage/mandate_versions/${id}`,undefined,tokens.otherFinancer)).status,404);
+ assert.equal((await request('POST',`portal/manage/mandate_versions/${id}/submit`,reason,tokens.financer)).status,200);
+ assert.equal((await request('PATCH',`portal/manage/mandate_versions/${id}`,{name:'Tampering'},tokens.financer)).status,409);
+ assert.equal((await request('POST',`portal/manage/mandate_versions/${id}/approve`,reason,tokens.ops)).status,200);
+ assert.equal((await request('POST',`portal/manage/mandate_versions/${id}/accept`,reason,tokens.financer)).status,422);
+ const accepted=await request('POST',`portal/manage/mandate_versions/${id}/accept`,{...reason,acknowledged:true},tokens.financer);assert.equal(accepted.status,200,JSON.stringify(accepted.data));assert.equal(accepted.data.status,'active');
+ const limit=await request('POST','portal/manage/limits',{scope_type:'programme',scope_id:fixture.programme.id,limit_type:'facility',amount:'10000',currency:'GHS',effective_from:'2026-01-01',authority_reference:'Credit committee 001'},tokens.ops);assert.equal(limit.status,201,JSON.stringify(limit.data));
+ assert.equal((await request('POST',`portal/manage/limits/${limit.data.id}/submit`,reason,tokens.ops)).status,200);
+ assert.equal((await request('POST',`portal/manage/limits/${limit.data.id}/approve`,reason,tokens.ops)).status,409);
+ assert.equal((await request('POST',`portal/manage/limits/${limit.data.id}/approve`,reason,tokens.checker)).status,200);
+ const before=(await rows('SELECT count(*) FROM ledger_journals'))[0].count;
+ const investigation=await request('POST','portal/manage/reconciliation_cases',{bank_reference:'UNMATCHED-001',expected_amount:'100',actual_amount:'90',currency:'USD',difference_reason:'Bank amount differs',owner_id:fixture.ops.id,due_at:'2030-12-01T12:00:00Z'},tokens.ops);assert.equal(investigation.status,201,JSON.stringify(investigation.data));
+ const resolved=await request('POST',`portal/manage/reconciliation_cases/${investigation.data.id}/resolve`,reason,tokens.ops);assert.equal(resolved.status,200,JSON.stringify(resolved.data));assert.equal(resolved.data.status,'resolved');
+ assert.equal((await rows('SELECT count(*) FROM ledger_journals'))[0].count,before);
+});
+
+test('access management disables accounts without losing history or allowing cross-organisation changes',async()=>{
+ const created=await request('POST','portal/manage/users',{email:'managed-member@example.test',password:'managed-password-123',password_confirmation:'managed-password-123',name:'Buyer colleague'},tokens.buyerAdmin);assert.equal(created.status,201,JSON.stringify(created.data));const id=created.data.id;
+ assert.ok(!JSON.stringify(created.data).includes('encrypted_password'));
+ const token=(await request('POST','auth/login',{email:'managed-member@example.test',password:'managed-password-123'})).headers.get('set-cookie')?.match(/invoix_token=([^;]+)/)?.[1];assert.ok(token);
+ assert.equal((await request('DELETE',`portal/manage/users/${id}`,undefined,tokens.otherAdmin)).status,404);
+ assert.equal((await request('DELETE',`portal/manage/users/${fixture.buyerAdmin.id}`,undefined,tokens.buyerAdmin)).status,409);
+ assert.equal((await request('DELETE',`portal/manage/users/${id}`,undefined,tokens.buyerAdmin)).status,204);
+ assert.equal((await request('GET','auth/me',undefined,token)).data.user,null);
+ assert.equal((await request('POST','auth/login',{email:'managed-member@example.test',password:'managed-password-123'})).status,401);
+ assert.equal((await request('POST',`portal/manage/users/${id}/restore`,{reason:'Restore access after reviewed approval'},tokens.buyerAdmin)).status,200);
+ assert.equal((await request('GET','auth/me',undefined,token)).data.user,null);
+});
+
+test('all management lists load; conditions and retained evidence use independent state transitions',async()=>{
+ const reason={reason:'Evidence checked independently'};
+ const modules=await request('GET','portal/modules',undefined,tokens.ops);
+ for(const entry of modules.data){const result=await request('GET',`portal/manage/${entry.key}`,undefined,tokens.ops);assert.equal(result.status,200,`${entry.key}: ${JSON.stringify(result.data)}`);}
+ const form=new FormData();form.set('file',new File(['%PDF-1.4\nmanagement evidence'], 'management-evidence.pdf',{type:'application/pdf'}));
+ const uploaded=await uploadDocument(new NextRequest('http://localhost:3000/api/portal/documents',{method:'POST',headers:{cookie:`invoix_token=${tokens.buyerAdmin}`},body:form}));assert.equal(uploaded.status,201);const doc=await uploaded.json();
+ const condition=await request('POST','portal/manage/conditions_precedent',{programme_id:fixture.programme.id,description:'Executed supplier participation agreement',owner_id:fixture.buyerAdmin.id,mandatory:true,due_date:'2030-01-01',evidence_id:doc.id},tokens.buyerAdmin);assert.equal(condition.status,201,JSON.stringify(condition.data));
+ assert.equal((await request('DELETE',`portal/manage/documents/${doc.id}`,undefined,tokens.buyerAdmin)).status,409);
+ assert.equal((await request('POST',`portal/manage/conditions_precedent/${condition.data.id}/satisfy`,reason,tokens.buyerAdmin)).status,409);
+ const satisfied=await request('POST',`portal/manage/conditions_precedent/${condition.data.id}/satisfy`,reason,tokens.ops);assert.equal(satisfied.status,200,JSON.stringify(satisfied.data));assert.equal(satisfied.data.status,'satisfied');
+ assert.equal((await request('PATCH',`portal/manage/conditions_precedent/${condition.data.id}`,{description:'Changed after approval'},tokens.ops)).status,409);
+ // Financiers cannot enumerate unrelated programme names through a lookup endpoint.
+ const hidden=await request('POST','portal/manage/programmes',{buyer_id:fixture.otherBuyer.id,name:'Confidential programme',currency:'GHS'},tokens.ops);assert.equal(hidden.status,201,JSON.stringify(hidden.data));
+ const options=await request('GET','portal/manage/mandate_versions/options/programmes',undefined,tokens.financer);assert.equal(options.status,200);assert.ok(!options.data.some((p:any)=>p.id===hidden.data.id));
+ const exception=await request('POST','portal/manage/exceptions',{kind:'DISPUTE',summary:'Investigate disputed delivery confirmation'},tokens.ops);assert.equal(exception.status,201);
+ assert.equal((await request('POST',`portal/manage/exceptions/${exception.data.id}/resolve`,reason,tokens.ops)).status,200);
 });
 
 test('health, authentication, origin checks, and invalid JSON',async()=>{
@@ -329,6 +431,7 @@ test('portal supplier approval, invited tender, draft bid privacy and complete f
  await rows("INSERT INTO financier_profiles(user_id,name,country,institution_type) VALUES($1,'Invited institution','GH','bank') ON CONFLICT(user_id) DO NOTHING",[fixture.financer.id]);
  await rows("INSERT INTO financier_profiles(user_id,name,country,institution_type) VALUES($1,'Other institution','GH','bank') ON CONFLICT(user_id) DO NOTHING",[fixture.otherFinancer.id]);
  const foreignLogin=await request('POST','auth/login',{email:fixture.otherAdmin.email,password:'changed-password-123'});const foreignToken=foreignLogin.headers.get('set-cookie')!.match(/invoix_token=([^;]+)/)![1];
+ await rows("UPDATE programmes SET status='active',currency='GHS',maximum_tenor_days=3650 WHERE id=$1",[fixture.programme.id]);
  const invoice=await createInvoice('draft');const endpoint=`portal/invoices/${invoice.id}`;
  assert.equal((await request('POST',`${endpoint}/submit`,{},tokens.buyerAdmin)).status,200);
  assert.equal((await request('POST',`${endpoint}/decide`,{decision:'reject'},tokens.supplierUser)).status,422);
@@ -414,4 +517,65 @@ test('expired and logged-out sessions are unusable; login throttling persists',a
   assert.equal((await request('GET','auth/me',undefined,live)).data.user,null);
   for(let attempt=0;attempt<10;attempt++) assert.equal((await request('POST','auth/login',{email:'missing@example.test',password:'wrong-password'})).status,401);
   assert.equal((await request('POST','auth/login',{email:'missing@example.test',password:'wrong-password'})).status,429);
+});
+test('operations review uploaded evidence with an independent reviewer and a required rejection reason',async()=>{
+  const upload=async()=>{const form=new FormData();form.set('file',new File(['%PDF-1.4 review'],'review.pdf',{type:'application/pdf'}));form.set('category','incorporation');const res=await uploadDocument(new NextRequest('http://localhost:3000/api/portal/documents',{method:'POST',headers:{cookie:`invoix_token=${tokens.buyerAdmin}`},body:form}));assert.equal(res.status,201);return (await res.json()).id;};
+  const first=await upload();const second=await upload();
+  assert.equal((await request('POST',`portal/document-reviews/${first}`,{decision:'verify'},tokens.buyerAdmin)).status,403);
+  assert.equal((await request('POST',`portal/document-reviews/${first}`,{decision:'reject',reason:'short'},tokens.ops)).status,422);
+  const rejected=await request('POST',`portal/document-reviews/${first}`,{decision:'reject',reason:'Registration number is not legible'},tokens.ops);
+  assert.equal(rejected.status,200,JSON.stringify(rejected.data));assert.equal(rejected.data.review_status,'rejected');assert.equal(rejected.data.verified_at,null);
+  assert.equal((await request('POST',`portal/document-reviews/${first}`,{decision:'verify'},tokens.checker)).status,409);
+  const verified=await request('POST',`portal/document-reviews/${second}`,{decision:'verify'},tokens.checker);
+  assert.equal(verified.data.review_status,'verified');assert.ok(verified.data.verified_at);
+  const [event]=await rows("SELECT reason FROM portal_events WHERE event='document.rejected' AND details->>'document_id'=$1",[String(first)]);
+  assert.equal(event.reason,'Registration number is not legible');
+  const [note]=await rows("SELECT subject FROM notifications WHERE user_id=$1 AND subject='Document rejected'",[fixture.buyerAdmin.id]);assert.ok(note);
+  const boot=await request('GET','portal/bootstrap',undefined,tokens.buyerAdmin);
+  assert.equal(boot.data.documents.find((d:any)=>String(d.id)===String(first)).review_reason,'Registration number is not legible');
+});
+test('change password verifies the current password, revokes other sessions and issues a new one',async()=>{
+  const hash=await bcrypt.hash('legacy-secret',4);const user=await transaction(db=>insert('users',{email:`changer-${randomUUID()}@example.test`,encrypted_password:hash,role:2,jti:randomUUID()},db));
+  const signIn=async(password:string)=>request('POST','auth/login',{email:user.email,password});
+  const old=(await signIn('legacy-secret')).headers.get('set-cookie')!.match(/invoix_token=([^;]+)/)![1];
+  assert.equal((await request('POST','auth/change-password',{current_password:'wrong-password',password:'Fresh-password-2026!',password_confirmation:'Fresh-password-2026!'},old)).status,422);
+  assert.equal((await request('POST','auth/change-password',{current_password:'legacy-secret',password:'Fresh-password-2026!',password_confirmation:'mismatch'},old)).status,422);
+  assert.equal((await request('POST','auth/change-password',{current_password:'legacy-secret',password:'Fresh-password-2026!',password_confirmation:'Fresh-password-2026!'})).status,401);
+  const changed=await request('POST','auth/change-password',{current_password:'legacy-secret',password:'Fresh-password-2026!',password_confirmation:'Fresh-password-2026!'},old);
+  assert.equal(changed.status,200,JSON.stringify(changed.data));
+  const fresh=changed.headers.get('set-cookie')!.match(/invoix_token=([^;]+)/)![1];
+  assert.equal((await request('GET','auth/me',undefined,old)).data.user,null);
+  assert.equal((await request('GET','auth/me',undefined,fresh)).data.user.id,String(user.id));
+  assert.equal((await signIn('legacy-secret')).status,401);
+  assert.equal((await signIn('Fresh-password-2026!')).status,200);
+});
+test('portal invoice form payload creates, edits, deletes and submits drafts with duplicate protection',async()=>{
+  const reason={reason:'Reviewed commercial configuration'};
+  await rows("INSERT INTO financier_profiles(user_id,name,country,institution_type) VALUES($1,'Form test institution','GH','bank') ON CONFLICT(user_id) DO NOTHING",[fixture.financer.id]);
+  const programme=await request('POST','portal/manage/programmes',{name:'Form programme',buyer_id:fixture.buyer.id,limit:'50000.00',fee_percent:'1',maturity_days:3650,currency:'GHS',programme_reference:`FORM-${randomUUID().slice(0,6)}`,governing_law:'Ghana',jurisdiction:'Accra',buyer_acceptance_authority:'buyer',allocation_policy:'deterministic',supplier_ids:[fixture.supplier.id],financier_ids:[fixture.financer.id]},tokens.ops);
+  assert.equal(programme.status,201,JSON.stringify(programme.data));const programmeId=programme.data.id;
+  const released=await request('POST',`portal/manage/programmes/${programmeId}/submit`,reason,tokens.buyerAdmin);assert.equal(released.status,200,JSON.stringify(released.data));
+  // Separation of duties (NC-05): the operator who configured the programme cannot release it.
+  assert.equal((await request('POST',`portal/manage/programmes/${programmeId}/activate`,reason,tokens.ops)).status,409);
+  const active=await request('POST',`portal/manage/programmes/${programmeId}/activate`,reason,tokens.checker);assert.equal(active.status,200,JSON.stringify(active.data));
+  // Exactly what the buyer's guided invoice form sends (frontend service invoicePayload).
+  const form=(number:string,overrides:Record<string,unknown>={})=>({programme_id:String(programmeId),supplier_id:String(fixture.supplier.id),invoice_number:number,purchase_order_reference:null,description:'Delivered goods to warehouse',amount:'2500.50',currency:'GHS',issue_date:'2026-01-01',due_date:'2030-06-30',payment_terms:'Net 1641 days',financing_eligible:true,supporting_documents:[],...overrides});
+  const draft=await request('POST','portal/manage/invoices',form('FORM-001',{amount:null,description:null,due_date:null,payment_terms:null}),tokens.buyerAdmin);
+  assert.equal(draft.status,201,JSON.stringify(draft.data));assert.equal(draft.data._actions.edit,true);assert.equal(draft.data._actions.delete,true);
+  const edited=await request('PATCH',`portal/manage/invoices/${draft.data.id}`,form('FORM-001',{purchase_order_reference:'PO-77'}),tokens.buyerAdmin);
+  assert.equal(edited.status,200,JSON.stringify(edited.data));assert.equal(edited.data.amount,'2500.50');assert.equal(edited.data.purchase_order_reference,'PO-77');
+  assert.equal((await request('POST','portal/manage/invoices',form('FORM-001'),tokens.buyerAdmin)).status,409);
+  // Suppliers confirm invoices; they cannot change the buyer's terms.
+  const supplierToken=(await request('POST','auth/login',{email:fixture.supplierUser.email,password:'legacy-secret'})).headers.get('set-cookie')?.match(/invoix_token=([^;]+)/)?.[1];
+  const supplierEdit=await request('PATCH',`portal/manage/invoices/${draft.data.id}`,form('FORM-001',{amount:'1'}),supplierToken);
+  assert.ok([403,409].includes(supplierEdit.status),JSON.stringify(supplierEdit));
+  const second=await request('POST','portal/manage/invoices',form('FORM-002'),tokens.buyerAdmin);assert.equal(second.status,201);
+  assert.equal((await request('DELETE',`portal/manage/invoices/${second.data.id}`,undefined,tokens.buyerAdmin)).status,204);
+  // Soft delete: kept for audit and restore, hidden from the buyer's invoice list.
+  const removed=(await request('GET',`portal/manage/invoices/${second.data.id}`,undefined,tokens.buyerAdmin)).data;assert.ok(removed.deleted_at);assert.equal(removed._actions.restore,true);
+  assert.equal((await request('GET','portal/bootstrap',undefined,tokens.buyerAdmin)).data.invoices.some((r:any)=>String(r.id)===String(second.data.id)),false);
+  const submitted=await request('POST',`portal/invoices/${draft.data.id}/submit`,{},tokens.buyerAdmin);assert.equal(submitted.status,200,JSON.stringify(submitted.data));
+  const locked=await request('GET',`portal/manage/invoices/${draft.data.id}`,undefined,tokens.buyerAdmin);
+  assert.equal(locked.data._actions.edit,false);assert.equal(locked.data._actions.delete,false);
+  assert.equal((await request('DELETE',`portal/manage/invoices/${draft.data.id}`,undefined,tokens.buyerAdmin)).status,409);
 });

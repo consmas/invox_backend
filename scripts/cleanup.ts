@@ -1,7 +1,8 @@
 import { loadEnvConfig } from '@next/env';
 import { closePool, rows } from '../src/server/db';
 
-loadEnvConfig(process.cwd());
+// Load .env.production only when NODE_ENV=production; local runs use .env.local / .env.development.
+loadEnvConfig(process.cwd(), process.env.NODE_ENV !== 'production');
 async function cleanup() {
   await rows('DELETE FROM app_sessions WHERE expires_at < now()');
   await rows("DELETE FROM auth_rate_limits WHERE window_start < now()-interval '1 day'");

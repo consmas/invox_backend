@@ -5,7 +5,8 @@ import { hashPassword } from '../src/server/auth';
 import { email, password } from '../src/server/validation';
 import { z } from 'zod';
 
-loadEnvConfig(process.cwd());
+// Load .env.production only when NODE_ENV=production; local runs use .env.local / .env.development.
+loadEnvConfig(process.cwd(), process.env.NODE_ENV !== 'production');
 async function seed() {
   const missing=['ADMIN_EMAIL','ADMIN_PASSWORD'].filter(key=>!process.env[key]?.trim());
   if(missing.length)throw new Error(`Set ${missing.join(' and ')} in nbackend/.env.local or your shell environment before running pnpm db:seed-admin.`);

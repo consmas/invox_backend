@@ -27,7 +27,7 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
     const data = z.object({ email, password: z.string().min(1).max(128),remember:z.boolean().default(true) }).parse(body);
     await rateLimit(`login:${data.email}`);
     const [user] = await rows('SELECT * FROM users WHERE lower(email)=$1', [data.email]);
-    const valid = user?.encrypted_password && await verifyPassword(data.password, user.encrypted_password);
+    const valid = !user?.disabled_at && user?.encrypted_password && await verifyPassword(data.password, user.encrypted_password);
     if (!user) await hashPassword('invalid-credentials-timing-padding');
     requireCondition(valid, 401, 'Invalid email or password');
     if(user.mfa_enrolled_at)return challengeFor(user,data.remember);
@@ -92,11 +92,29 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
     });
     return NextResponse.json({ ok:true });
   }
+  if (action === 'change-password' && req.method === 'POST') {
+    const actor = await actorForToken(requestToken(req));
+    requireCondition(actor, 401, 'Authentication required');
+    const raw = body as Record<string, unknown>;
+    const data = z.object({ current_password:z.string().min(1).max(128), password, password_confirmation:z.string() }).parse(raw);
+    requireCondition(data.password === data.password_confirmation, 422, 'Passwords do not match');
+    requireCondition(data.password !== data.current_password, 422, 'Choose a password different from the current one');
+    await rateLimit(`change-password:${actor.id}`, 5);
+    const token = await transaction(async db => {
+      const [user] = await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE', [actor.id], db);
+      requireCondition(user?.encrypted_password && await verifyPassword(data.current_password, user.encrypted_password), 422, 'Current password is incorrect');
+      // Every other session is signed out; this browser receives a fresh session.
+      await revokeSessions(String(user.id), db);
+      const updated = await update('users', String(user.id), { encrypted_password:await hashPassword(data.password) }, db);
+      return createSession(updated, db);
+    });
+    return withSession(NextResponse.json({ ok:true }), token);
+  }
   if (action === 'invite' && req.method === 'GET') {
     const token = req.nextUrl.searchParams.get('token') ?? '';
     const [supplier] = await rows(`SELECT name,email FROM suppliers WHERE invitation_token=$1 AND invitation_expires_at>now()`, [digest(token)]);
     requireCondition(supplier, 404, 'Invitation is invalid or expired');
     return NextResponse.json(supplier);
   }
-  throw new ApiError(['login','logout','signup','me','password','forgot-password','reset-password','invite'].includes(action) ? 405 : 404, 'Not found or method not allowed');
+  throw new ApiError(['login','logout','signup','me','password','forgot-password','reset-password','invite','change-password'].includes(action) ? 405 : 404, 'Not found or method not allowed');
 }

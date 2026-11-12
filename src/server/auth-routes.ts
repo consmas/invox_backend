@@ -68,7 +68,7 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
   if ((action === 'forgot-password' || action === 'password') && req.method === 'POST') {
     const data = z.object({ email }).parse(body);
     await rateLimit(`reset:${data.email}`, 5);
-    requireMailConfiguration();
+    await requireMailConfiguration();
     const base = appUrl();
     const [user] = await rows('SELECT id FROM users WHERE lower(email)=$1', [data.email]);
     let preview: { preview_url?: string } = {};

@@ -523,7 +523,7 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
       const existing = (await rows('SELECT * FROM users WHERE email=$1 FOR UPDATE', [data.contact_email], db))[0];
       requireCondition(!existing || existing.role === 1, 409, 'Email belongs to a different account role');
       requireCondition(!existing || !(await rows('SELECT id FROM suppliers WHERE user_id=$1', [existing.id], db)).length, 409, 'Account already has a supplier profile');
-      if (data.invite === 'invite') { requireMailConfiguration(); appUrl(); }
+      if (data.invite === 'invite') { await requireMailConfiguration(); appUrl(); }
       if (!existing && data.invite === 'create') {
         requireCondition(data.password, 422, 'Password is required');
         requireCondition(!data.password_confirmation || data.password === data.password_confirmation, 422, 'Passwords do not match');
@@ -540,7 +540,7 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
     requireCondition(supplierId, 405, 'Method not allowed');
     const previous = found((await rows('SELECT * FROM suppliers WHERE id=$1 FOR UPDATE', [supplierId], db))[0]);
     if (resend) {
-      requireMailConfiguration(); appUrl();
+      await requireMailConfiguration(); appUrl();
       const token=newToken();
       await update('suppliers',supplierId,{invitation_token:digest(token),invited_at:new Date(),invitation_expires_at:new Date(Date.now()+7*86400000)},db);
       invitation={email:previous.email,token};

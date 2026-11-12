@@ -62,7 +62,7 @@ before(async()=>{
   process.env.DOCUMENT_STORAGE_PATH=await mkdtemp(join(tmpdir(),'invox-upload-test-'));
   process.env.MFA_SECRET_KEY='a'.repeat(64);
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql','011_security_hardening.sql','012_field_completeness.sql','013_organisation_administration.sql','014_super_admin_delegation.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
+  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql','011_security_hardening.sql','012_field_completeness.sql','013_organisation_administration.sql','014_super_admin_delegation.sql','015_integration_settings.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
   const password=await bcrypt.hash('legacy-secret',4);
   // $2a$ is the bcrypt prefix used by existing Devise accounts.
   const legacy=password.replace('$2b$','$2a$');

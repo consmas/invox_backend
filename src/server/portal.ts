@@ -12,6 +12,7 @@ import {digest,newToken} from './auth';
 import {sendLink,appUrl} from './mail';
 import {orgRef,portalEvent,notify,sessionData} from './portal-support';
 import {preparedOnBehalfBy} from './act-for';
+import {integrationsRequest} from './integrations';
 export {orgRef,portalEvent,sessionData} from './portal-support';
 const same=(a:unknown,b:unknown)=>String(a)===String(b);
 // Field policy (F09): counterparties receive only the identity and terms needed to act; private legal, fee,
@@ -85,6 +86,7 @@ async function ownedInvoice(actor:Actor,invoiceId:string,db:DB){
 export async function portalRequest(actor:Actor,method:string,path:string[],body:Row):Promise<{data?:unknown;status?:number}>{
  const [,resource,rawId,action]=path;
  if(resource==='manage'||resource==='modules')return managementRequest(actor,method,path,body);
+ if(resource==='integrations')return integrationsRequest(actor,method,path,body);
  if(method==='GET'&&resource==='session')return {data:await sessionData(actor)};
  if(method==='GET'&&resource==='bootstrap')return {data:await bootstrap(actor)};
  if(resource==='profile'&&method==='PATCH'){

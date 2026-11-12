@@ -5,7 +5,8 @@ import { rows, transaction, type DB, type Row } from './db';
 import { ApiError, requireCondition } from './errors';
 import { id, email } from './validation';
 import { fieldCatalog, fieldSchema, coreSchema, databaseValues, rejectManagedFields, validateFieldReferences, entityAudit } from './fields';
-import { resourceRequest, invoiceList } from './resources';
+import { resourceRequest, invoiceList, lockOperatorSet } from './resources';
+import { assertFresh } from './context';
 import { portalEvent, notify } from './portal-support';
 import { cents } from './money';
 type Module = {
@@ -131,6 +132,11 @@ async function actionsFor(entity: string, record: Row, actor: Actor, db: DB) {
     const own = actor.role === 'platform_ops' || same(record.created_by, actor.id);
     return { edit: draft && own, delete: draft && own, submit: record.status === 'draft' && own, approve: actor.role === 'platform_ops' && record.status === 'pending_review' && !same(record.created_by, actor.id) && !same(record.last_modified_by, actor.id), accept: entity === 'mandate_versions' && actor.role === 'financer' && same(record.financier_id, actor.id) && record.status === 'pending_acceptance', withdraw: entity === 'financing_requests' && ['draft', 'submitted'].includes(record.status) && own, review: entity === 'financing_requests' && ownerRole(actor) && record.status === 'submitted', decline: entity === 'financing_requests' && ownerRole(actor) && record.status === 'submitted', resolve: entity === 'reconciliation_cases' && record.status === 'open' && actor.role === 'platform_ops', satisfy: entity === 'conditions_precedent' && record.status === 'pending' && actor.role === 'platform_ops' && !same(record.created_by, actor.id) && !same(record.last_modified_by, actor.id), reason: !draft ? 'Submitted or released records are locked; use the available workflow action.' : null };
 }
+/** The caller's buyer organisation. Buyer roles without an active membership are refused, never widened (F01). */
+function tenantBuyer(actor: Actor): string {
+    requireCondition(actor.role === 'buyer_admin' && actor.buyer_id, 403, 'Your account is not linked to an active organisation');
+    return actor.buyer_id;
+}
 async function listRecords(entity: string, actor: Actor, db: DB, recordId?: string, includeDeleted = false): Promise<Row[]> {
     let records: Row[] = [];
     if (['buyers', 'suppliers', 'financers', 'users'].includes(entity)) {
@@ -141,29 +147,40 @@ async function listRecords(entity: string, actor: Actor, db: DB, recordId?: stri
             requireRole(actor, 'platform_ops');
             const result = await resourceRequest(actor, 'GET', recordId ? [entity, recordId] : [entity]);
             records = recordId ? [result.data as Row] : result.data as Row[];
-            for (const record of records) {
-                const [state] = await rows(`SELECT ${entity === 'users' ? 'disabled_at' : 'archived_at'} FROM ${tableFor(entity)} WHERE ${entity === 'financers' ? 'user_id' : 'id'}=$1`, [record.id], db);
-                Object.assign(record, state);
-            }
+            const key = entity === 'financers' ? 'user_id' : 'id';
+            const states = await rows(`SELECT ${key} AS id,${entity === 'users' ? 'disabled_at' : 'archived_at'} FROM ${tableFor(entity)} WHERE ${key}=ANY($1::bigint[])`, [records.map(r => r.id)], db);
+            for (const record of records)
+                Object.assign(record, Object.fromEntries(Object.entries(states.find(state => same(state.id, record.id)) ?? {}).filter(([k]) => k !== 'id')));
         }
     }
     else if (entity === 'programmes') {
-        records = await rows('SELECT * FROM programmes WHERE ($1::bigint IS NULL OR buyer_id=$1) ORDER BY id DESC', [actor.role === 'platform_ops' ? null : actor.buyer_id], db);
+        // Operations and tenant queries are separate statements; a missing tenant is never a wildcard (F01).
+        const filter = recordId ? ' AND id=$2' : '';
+        records = actor.role === 'platform_ops'
+            ? await rows(`SELECT * FROM programmes WHERE TRUE${recordId ? ' AND id=$1' : ''} ORDER BY id DESC`, recordId ? [recordId] : [], db)
+            : await rows(`SELECT * FROM programmes WHERE buyer_id=$1${filter} ORDER BY id DESC`, [tenantBuyer(actor), ...(recordId ? [recordId] : [])], db);
+        const ids = records.map(r => r.id);
+        const suppliers = await rows('SELECT programme_id,supplier_id FROM portal_programme_suppliers WHERE programme_id=ANY($1::bigint[])', [ids], db);
+        const financiers = await rows('SELECT programme_id,financer_id FROM portal_programme_financiers WHERE programme_id=ANY($1::bigint[])', [ids], db);
         for (const r of records) {
-            r.supplier_ids = (await rows('SELECT supplier_id FROM portal_programme_suppliers WHERE programme_id=$1', [r.id], db)).map(m => m.supplier_id);
-            r.financier_ids = (await rows('SELECT financer_id FROM portal_programme_financiers WHERE programme_id=$1', [r.id], db)).map(m => m.financer_id);
+            r.supplier_ids = suppliers.filter(m => same(m.programme_id, r.id)).map(m => m.supplier_id);
+            r.financier_ids = financiers.filter(m => same(m.programme_id, r.id)).map(m => m.financer_id);
         }
     }
     else if (entity === 'supplier_relationships') {
-        records = await rows(`SELECT r.*,s.name,s.country,s.registration_number,s.email AS supplier_email,s.archived_at FROM portal_supplier_relationships r JOIN suppliers s ON s.id=r.supplier_id WHERE ($1::bigint IS NULL OR r.buyer_id=$1) ORDER BY s.name`, [actor.role === 'platform_ops' ? null : actor.buyer_id], db);
+        const select = 'SELECT r.*,s.name,s.country,s.registration_number,s.email AS supplier_email,s.archived_at FROM portal_supplier_relationships r JOIN suppliers s ON s.id=r.supplier_id';
+        records = actor.role === 'platform_ops'
+            ? await rows(`${select} WHERE TRUE${recordId ? ' AND r.id=$1' : ''} ORDER BY s.name`, recordId ? [recordId] : [], db)
+            : await rows(`${select} WHERE r.buyer_id=$1${recordId ? ' AND r.id=$2' : ''} ORDER BY s.name`, [tenantBuyer(actor), ...(recordId ? [recordId] : [])], db);
+        const links = await rows('SELECT ps.programme_id,ps.supplier_id,p.buyer_id FROM portal_programme_suppliers ps JOIN programmes p ON p.id=ps.programme_id WHERE ps.supplier_id=ANY($1::bigint[])', [records.map(r => r.supplier_id)], db);
         for (const r of records)
-            r.programme_ids = (await rows('SELECT ps.programme_id FROM portal_programme_suppliers ps JOIN programmes p ON p.id=ps.programme_id WHERE ps.supplier_id=$1 AND p.buyer_id=$2', [r.supplier_id, r.buyer_id], db)).map(p => p.programme_id);
+            r.programme_ids = links.filter(l => same(l.supplier_id, r.supplier_id) && same(l.buyer_id, r.buyer_id)).map(l => l.programme_id);
     }
     else {
-        const scoped = (await resourceRequest(actor, 'GET', ['invoices'])).data as Row[];
+        const scoped = entity === 'invoices' ? await invoiceList(actor, undefined, undefined, db, includeDeleted) : await invoiceList(actor, undefined, undefined, db);
         const invoiceIds = scoped.map(i => i.id);
         if (entity === 'invoices')
-            records = await invoiceList(actor, undefined, undefined, db, includeDeleted);
+            records = scoped;
         else if (['agreements', 'fundings', 'repayments', 'positions'].includes(entity)) {
             let ids = invoiceIds;
             if (actor.role === 'financer')
@@ -185,7 +202,8 @@ async function listRecords(entity: string, actor: Actor, db: DB, recordId?: stri
         else if (entity === 'mandate_versions')
             records = await rows('SELECT * FROM mandate_versions WHERE $1 OR financier_id=$2 ORDER BY id DESC', [actor.role === 'platform_ops', actor.id], db);
         else if (entity === 'conditions_precedent')
-            records = await rows('SELECT c.* FROM conditions_precedent c JOIN programmes p ON p.id=c.programme_id WHERE $1 OR p.buyer_id=$2 ORDER BY c.id DESC', [actor.role === 'platform_ops', actor.buyer_id], db);
+            records = actor.role === 'platform_ops' ? await rows('SELECT c.* FROM conditions_precedent c ORDER BY c.id DESC', [], db)
+                : await rows('SELECT c.* FROM conditions_precedent c JOIN programmes p ON p.id=c.programme_id WHERE p.buyer_id=$1 ORDER BY c.id DESC', [tenantBuyer(actor)], db);
         else if (entity === 'exceptions')
             records = await rows('SELECT * FROM portal_exceptions ORDER BY id DESC LIMIT 250', [], db);
         else
@@ -237,7 +255,7 @@ async function options(entity: string, target: string, actor: Actor, db: DB) {
     if (target === 'suppliers')
         return actor.role === 'platform_ops' ? await rows('SELECT id,name FROM suppliers WHERE archived_at IS NULL', [], db) : actor.role === 'supplier_user' ? await rows('SELECT id,name FROM suppliers WHERE user_id=$1', [actor.id], db) : await rows("SELECT s.id,s.name FROM suppliers s JOIN portal_supplier_relationships r ON r.supplier_id=s.id WHERE r.buyer_id=$1 AND r.status='active' AND s.archived_at IS NULL", [actor.buyer_id], db);
     if (target === 'financers')
-        return await rows('SELECT u.id,f.name FROM users u JOIN financier_profiles f ON f.user_id=u.id WHERE u.role=3 AND u.disabled_at IS NULL AND f.archived_at IS NULL AND ($1 OR u.id=$2 OR $3)', [actor.role === 'platform_ops', actor.id, actor.role === 'buyer_admin'], db);
+        return await rows('SELECT u.id,f.name FROM users u JOIN financier_profiles f ON f.user_id=u.id WHERE u.role=3 AND u.disabled_at IS NULL AND f.archived_at IS NULL AND ($1 OR u.id=$2 OR $3)', [actor.role === 'platform_ops', actor.id, actor.role === 'buyer_admin' && !!actor.buyer_id], db);
     if (target === 'users')
         return await rows('SELECT id,coalesce(name,email) AS name FROM users WHERE disabled_at IS NULL AND ($1 OR buyer_id=$2 OR id=$3)', [actor.role === 'platform_ops', actor.buyer_id, actor.id], db);
     if (target === 'invoices') {
@@ -287,8 +305,11 @@ export async function managementRequest(actor: Actor, method: string, path: stri
             await invoice(actor, String(previous!.invoice_id), db, true);
         if (recordId && !['buyers', 'suppliers', 'financers', 'users'].includes(entity))
             await rows(`SELECT id FROM "${entity === 'exceptions' ? 'portal_exceptions' : tableFor(entity)}" WHERE id=$1 FOR UPDATE`, [recordId], db);
-        if (recordId)
+        if (recordId) {
             previous = (await listRecords(entity, actor, db, recordId, true))[0];
+            requireCondition(previous, 404, 'Record not found');
+            if (method === 'PATCH') assertFresh(previous);
+        }
         const permissions: Row = previous ? await actionsFor(entity, previous, actor, db) : {};
         if (recordId && action) {
             requireCondition(method === 'POST', 405, 'Lifecycle actions require POST');
@@ -428,8 +449,8 @@ export async function managementRequest(actor: Actor, method: string, path: stri
 }
 async function disableUser(actor: Actor, record: Row, db: DB) {
     requireCondition(!same(record.id, actor.id), 409, 'You cannot disable your own account');
-    // Serialise role-count checks so two concurrent removals cannot remove the last administrator.
-    await rows('SELECT id FROM users WHERE role IN (0,2) ORDER BY id FOR UPDATE', [], db);
+    // Serialise role-count checks with the same lock used by role changes, so concurrent removals cannot remove the last administrator.
+    await lockOperatorSet(db);
     const [user] = await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE', [record.id], db);
     requireCondition(user, 404, 'User not found');
     requireCondition(actor.role === 'platform_ops' || actor.role === 'buyer_admin' && same(user.buyer_id, actor.buyer_id) && user.role === 0, 403, 'Account is outside your management scope');
@@ -479,6 +500,7 @@ async function transition(entity: string, recordId: string, action: string, inpu
     const reason = reasonSchema.parse(input.reason);
     let result: Row;
     if (entity === 'programmes') {
+        await programme(actor, recordId, db, true);
         if (['submit', 'activate'].includes(action)) {
             coreSchema('programmes').parse(previous);
             requireCondition(previous.buyer_acceptance_authority !== 'unconfigured' && previous.allocation_policy !== 'unconfigured', 422, 'Configure acceptance authority and allocation policy before release');
@@ -539,6 +561,7 @@ async function transition(entity: string, recordId: string, action: string, inpu
         result = { id: result.id, email: result.email, disabled_at: result.disabled_at };
     }
     else if (entity === 'supplier_relationships') {
+        requireCondition(actor.role === 'platform_ops' || same(previous.buyer_id, tenantBuyer(actor)), 403, 'Relationship is outside your organisation');
         result = (await rows('UPDATE portal_supplier_relationships SET status=$3,updated_at=now() WHERE buyer_id=$1 AND supplier_id=$2 RETURNING *', [previous.buyer_id, previous.supplier_id, action === 'archive' ? 'archived' : 'active'], db))[0];
     }
     else if (entity === 'financing_requests') {
@@ -562,6 +585,8 @@ async function transition(entity: string, recordId: string, action: string, inpu
     }
     else if (entity === 'conditions_precedent') {
         requireCondition(previous.evidence_id, 422, 'Attach evidence before recording satisfaction');
+        const [evidence] = await rows('SELECT review_status,archived_at,upload_status FROM documents WHERE id=$1', [previous.evidence_id], db);
+        requireCondition(evidence && !evidence.archived_at && evidence.upload_status === 'stored' && evidence.review_status === 'verified', 409, 'The evidence must be verified by operations before the condition can be satisfied');
         await validateFieldReferences(entity, previous, actor, db);
         result = await save(entity, { status: 'satisfied', satisfied_at: new Date() }, db, recordId);
     }

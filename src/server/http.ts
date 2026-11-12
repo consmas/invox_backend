@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { authenticate, verifyOrigin } from './auth';
+import { authenticate, verifyOrigin, privilegedMfaRequired, type Actor } from './auth';
 import { authRequest } from './auth-routes';
 import { ApiError } from './errors';
 import { resourceRequest } from './resources';
@@ -9,15 +9,75 @@ import { financeRequest } from './finance';
 import {portalRequest,sessionData} from './portal';
 import {portalAuth} from './portal-auth';
 import { definitions,controlRecords,lookup } from './control-records';
+import { withRequest } from './context';
 
-export async function handleRequest(req: NextRequest, path: string[]): Promise<NextResponse> {
+const JSON_LIMIT = 1024 * 1024;
+/** Reads at most `limit` bytes; a missing or false Content-Length cannot make the server buffer more. */
+export async function readLimited(req: NextRequest, limit: number): Promise<Uint8Array> {
+  const declared = Number(req.headers.get('content-length') ?? 0);
+  if (declared > limit) throw new ApiError(413, 'Request body is too large');
+  if (!req.body) return new Uint8Array();
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > limit) { await reader.cancel().catch(() => undefined); throw new ApiError(413, 'Request body is too large'); }
+    chunks.push(value);
+  }
+  const body = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) { body.set(chunk, offset); offset += chunk.byteLength; }
+  return body;
+}
+/** Headers for every API response, including errors; the browser must never frame, sniff or cache API data. */
+export function secureHeaders(res: NextResponse) {
+  res.headers.set('Cache-Control','no-store');
+  res.headers.set('X-Content-Type-Options','nosniff');
+  res.headers.set('X-Frame-Options','DENY');
+  res.headers.set('Content-Security-Policy',"default-src 'none'; frame-ancestors 'none'; sandbox");
+  res.headers.set('Referrer-Policy','no-referrer');
+  res.headers.set('Cross-Origin-Resource-Policy','same-origin');
+  if (process.env.NODE_ENV === 'production') res.headers.set('Strict-Transport-Security','max-age=31536000; includeSubDomains');
+  return res;
+}
+/** Paths an account without an approved organisation (or without any buyer membership) may use: its own onboarding only. */
+function onboardingPath(method: string, path: string[]) {
+  const route = `${method} ${path.join('/')}`;
+  return ['GET portal/session','GET portal/bootstrap','PATCH portal/profile','POST portal/notifications'].includes(route) || method === 'GET' && path[0] === 'field-definitions';
+}
+async function gate(actor: Actor, method: string, path: string[]) {
+  if (privilegedMfaRequired(actor)) {
+    if (method === 'GET' && path.join('/') === 'portal/session') return;
+    throw new ApiError(403, 'Operations accounts must enrol and verify an authenticator before using the workspace');
+  }
+  if (actor.role === 'platform_ops') return;
+  // Fail closed: a buyer role with no active buyer membership is never treated as an unrestricted scope.
+  const orphaned = actor.role === 'buyer_admin' && !actor.buyer_id;
+  if (!orphaned && onboardingPath(method, path)) return;
+  const session = await sessionData(actor);
+  if ((orphaned || session.needs_onboarding) && !onboardingPath(method, path))
+    throw new ApiError(403, orphaned && !session.needs_onboarding ? 'Your account is not linked to an active organisation' : 'Complete organisation verification before using transaction actions');
+}
+function transient(error: unknown) {
+  if (!error || typeof error !== 'object') return false;
+  const code = 'code' in error ? String(error.code) : '';
+  const message = 'message' in error ? String(error.message) : '';
+  return ['57014','55P03','53300','40001','40P01','57P01','ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND','EAI_AGAIN'].includes(code) || /timeout exceeded when trying to connect|connection timeout/i.test(message);
+}
+
+export function handleRequest(req: NextRequest, path: string[]): Promise<NextResponse> {
+  return withRequest(req, () => dispatch(req, path));
+}
+async function dispatch(req: NextRequest, path: string[]): Promise<NextResponse> {
   try {
     verifyOrigin(req);
     if (path[0] === 'v1') path = path.slice(1);
     let body: Record<string, unknown> = {};
     if (['POST','PATCH','PUT'].includes(req.method)) {
-      const text = await req.text();
-      if (text.length > 1024*1024) throw new ApiError(413, 'Request body is too large');
+      const text = new TextDecoder().decode(await readLimited(req, JSON_LIMIT));
       if (text) {
         try { body = z.record(z.string(),z.unknown()).parse(JSON.parse(text)); }
         catch { throw new ApiError(400, 'Expected a JSON object'); }
@@ -31,7 +91,7 @@ export async function handleRequest(req: NextRequest, path: string[]): Promise<N
       res = NextResponse.json({ status:'ok',backend:'nextjs' });
     } else {
       const actor = await authenticate(req);
-      if(['POST','PATCH','PUT','DELETE'].includes(req.method)&&!(path[0]==='portal'&&['profile','notifications'].includes(path[1]))){const session=await sessionData(actor);if(session.needs_onboarding)throw new ApiError(403,'Complete organisation verification before using transaction actions');}
+      await gate(actor, req.method, path);
       if(req.headers.has('idempotency-key'))body.idempotency_key=req.headers.get('idempotency-key');
       const financial=['agreements','fundings','repayments'].includes(path[0])||path[0]==='invoices'&&['financials','agreements','fundings','repayments'].includes(path[2]);
       const result: {status?:number;data?:unknown} = path[0]==='portal'?await portalRequest(actor,req.method,path,body):path[0]==='field-definitions'&&req.method==='GET'?await definitions(actor,path)
@@ -40,22 +100,22 @@ export async function handleRequest(req: NextRequest, path: string[]): Promise<N
         :financial?await financeRequest(actor,req.method,path,body):await resourceRequest(actor,req.method,path,body);
       res = result.status === 204 ? new NextResponse(null,{status:204}) : NextResponse.json(result.data,{status:result.status ?? 200});
     }
-    res.headers.set('Cache-Control','no-store');
-    res.headers.set('X-Content-Type-Options','nosniff');
-    return res;
+    return secureHeaders(res);
   } catch (error) {
     let status = 500;
     let message = 'Internal server error';
     if (error instanceof ApiError) { status=error.status; message=error.message; }
     else if (error instanceof z.ZodError) { status=422; message=error.issues.map(issue => `${issue.path.join('.')}: ${issue.message}`).join('; '); }
+    else if (transient(error)) { status=503; message='The service is busy. Please retry shortly.'; }
     else if (error && typeof error === 'object' && 'code' in error) {
       if (error.code === '23505') { status=409; message='A record with those details already exists'; }
       if (error.code === '23503') { status=409; message='Record has related data or a referenced record does not exist'; }
       if (error.code === '23514' || error.code === '22003' || error.code === '23502') { status=422; message='Invalid field value'; }
     }
     if (status === 500) console.error('API request failed',error);
-    const res = NextResponse.json({error:message,errors:[message]},{status,headers:{'Cache-Control':'no-store'}});
+    const res = secureHeaders(NextResponse.json({error:message,errors:[message]},{status}));
     if (status===429) res.headers.set('Retry-After','900');
+    if (status===503) res.headers.set('Retry-After','5');
     return res;
   }
 }

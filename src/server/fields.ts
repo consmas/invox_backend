@@ -115,7 +115,7 @@ export async function entityAudit(db:DB,actor:Actor,entity:string,recordId:strin
   function redact(record:Row|null){
     if(!record)return null;const result={...record};
     for(const field of fieldCatalog[entity]?.fields??[]){if(field.protected||field.type==='password')delete result[field.key];}
-    delete result.encrypted_password;delete result.invitation_token;delete result.reset_password_token;delete result.jti;
+    delete result.encrypted_password;delete result.invitation_token;delete result.reset_password_token;delete result.jti;delete result.mfa_secret_encrypted;delete result.mfa_last_used_step;
     return result;
   }
   await rows('INSERT INTO entity_audit_events(actor_id,entity,record_id,action,before_data,after_data) VALUES($1,$2,$3,$4,$5,$6)',[actor.id,entity,recordId,action,JSON.stringify(redact(before)),JSON.stringify(redact(after))],db);

@@ -43,17 +43,26 @@ async function login(name:string) {
   const token=result.headers.get('set-cookie')?.match(/invoix_token=([^;]+)/)?.[1];
   assert.ok(token);tokens[name]=token;return token;
 }
+function totp(secret:Buffer,offsetSteps=0){const counter=Buffer.alloc(8);counter.writeBigUInt64BE(BigInt(Math.floor(Date.now()/30000)+offsetSteps));const hash=createHmac('sha1',secret).update(counter).digest();const offset=hash[19]&15;return String((hash.readUInt32BE(offset)&0x7fffffff)%1000000).padStart(6,'0');}
 const invoiceFields=()=>({invoice_number:randomUUID(),currency:'GHS',issue_date:'2026-01-01',due_date:'2030-12-31',description:'Delivered goods',payment_terms:'Net 30',financing_eligible:true});
 const bidFields={currency:'GHS',discount_type:'fixed',discount_fee:'0',other_fees:'0',day_count_basis:'365',expiry_date:'2030-12-01'};
-async function createInvoice(status='tender') {
-  const result=await request('POST',`buyers/${fixture.buyer.id}/invoices`,{invoice:{...invoiceFields(),programme_id:fixture.programme.id,supplier_id:fixture.supplier.id,amount:'1000.00',status,due_date:'2030-12-31'}},tokens.ops);
-  assert.equal(result.status,201,JSON.stringify(result.data));return result.data;
+/** Drafts come from the API. Supplier approval and tender publication have their own workflow tests; other tests set them up as fixture state. */
+async function createInvoice(status='tender',invited=['financer','otherFinancer']) {
+  const result=await request('POST',`buyers/${fixture.buyer.id}/invoices`,{invoice:{...invoiceFields(),programme_id:fixture.programme.id,supplier_id:fixture.supplier.id,amount:'1000.00',status:'draft',due_date:'2030-12-31'}},tokens.ops);
+  assert.equal(result.status,201,JSON.stringify(result.data));
+  if(status==='draft')return result.data;
+  await rows("UPDATE invoices SET status='approved',invoice_approval_status='approved',supplier_approved_at=now(),supplier_approved_by=$2 WHERE id=$1",[result.data.id,fixture.supplierUser.id]);
+  if(status==='approved')return {...result.data,status:'approved'};
+  const [tender]=await rows("INSERT INTO financing_tenders(invoice_id,programme_id,tender_reference,currency,financing_amount_requested,opens_at,closes_at,maturity_date,eligible_conditions,risk_disclosures,published_by,published_at,status,created_by) VALUES($1,$2,$3,'GHS','1000.00',now(),now()+interval '30 days','2030-12-31','Invited financiers only','Test disclosure',$4,now(),'open',$4) RETURNING id",[result.data.id,fixture.programme.id,`TND-${randomUUID().slice(0,8)}`,fixture.ops.id]);
+  for(const name of invited)await rows('INSERT INTO portal_tender_invitations VALUES($1,$2)',[tender.id,fixture[name].id]);
+  await rows("UPDATE invoices SET status='tender' WHERE id=$1",[result.data.id]);
+  return {...result.data,status:'tender',tender_id:tender.id};
 }
 before(async()=>{
   process.env.DOCUMENT_STORAGE_PATH=await mkdtemp(join(tmpdir(),'invox-upload-test-'));
   process.env.MFA_SECRET_KEY='a'.repeat(64);
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
+  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql','011_security_hardening.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
   const password=await bcrypt.hash('legacy-secret',4);
   // $2a$ is the bcrypt prefix used by existing Devise accounts.
   const legacy=password.replace('$2b$','$2a$');
@@ -168,6 +177,8 @@ test('all management lists load; conditions and retained evidence use independen
  const condition=await request('POST','portal/manage/conditions_precedent',{programme_id:fixture.programme.id,description:'Executed supplier participation agreement',owner_id:fixture.buyerAdmin.id,mandatory:true,due_date:'2030-01-01',evidence_id:doc.id},tokens.buyerAdmin);assert.equal(condition.status,201,JSON.stringify(condition.data));
  assert.equal((await request('DELETE',`portal/manage/documents/${doc.id}`,undefined,tokens.buyerAdmin)).status,409);
  assert.equal((await request('POST',`portal/manage/conditions_precedent/${condition.data.id}/satisfy`,reason,tokens.buyerAdmin)).status,409);
+ assert.equal((await request('POST',`portal/manage/conditions_precedent/${condition.data.id}/satisfy`,reason,tokens.ops)).status,409);
+ assert.equal((await request('POST',`portal/document-reviews/${doc.id}`,{decision:'verify'},tokens.checker)).status,200);
  const satisfied=await request('POST',`portal/manage/conditions_precedent/${condition.data.id}/satisfy`,reason,tokens.ops);assert.equal(satisfied.status,200,JSON.stringify(satisfied.data));assert.equal(satisfied.data.status,'satisfied');
  assert.equal((await request('PATCH',`portal/manage/conditions_precedent/${condition.data.id}`,{description:'Changed after approval'},tokens.ops)).status,409);
  // Financiers cannot enumerate unrelated programme names through a lookup endpoint.
@@ -227,8 +238,10 @@ test('global, nested, programme-scoped, and v1 invoice routes resolve consistent
   for(const path of ['invoices',`buyers/${fixture.buyer.id}/invoices`,`programmes/${fixture.programme.id}/invoices`,'v1/invoices']){
     const result=await request('GET',path,undefined,tokens.ops);assert.equal(result.status,200,`${path}: ${JSON.stringify(result.data)}`);assert.ok(result.data.some((i:any)=>String(i.id)===String(fixture.invoice.id)));
   }
-  const changed=await request('PATCH',`buyers/${fixture.buyer.id}/invoices/${fixture.invoice.id}`,{invoice:{due_date:'2031-01-01'}},tokens.ops);
-  assert.equal(changed.status,200);assert.equal(changed.data.status,'tender');
+  assert.equal((await request('PATCH',`buyers/${fixture.buyer.id}/invoices/${fixture.invoice.id}`,{invoice:{due_date:'2031-01-01'}},tokens.ops)).status,409);
+  const draft=await createInvoice('draft');
+  const changed=await request('PATCH',`buyers/${fixture.buyer.id}/invoices/${draft.id}`,{invoice:{due_date:'2031-01-01'}},tokens.ops);
+  assert.equal(changed.status,200,JSON.stringify(changed.data));assert.equal(changed.data.status,'draft');
 });
 test('validation rejects invalid money, dates, and unsupported status transitions',async()=>{
   for(const amount of ['-1','0','1.001','NaN']){
@@ -328,7 +341,14 @@ test('unbalanced journals roll back and production execution has no feature-flag
     await rows("INSERT INTO ledger_lines(journal_id,account_code,side,amount) VALUES($1,'buyer_obligation','debit',1)",[journal.id],db);
   }),/balanced/);
   const previous=process.env.NODE_ENV;Object.assign(process.env,{NODE_ENV:'production'});
-  try{assert.equal((await request('POST',`invoices/${fixture.invoice.id}/repayments`,{idempotency_key:'production-forbidden'},tokens.ops)).status,503);}
+  try{
+    // Production: an operations session without a verified authenticator is restricted to enrolment (F24)…
+    assert.equal((await request('POST',`invoices/${fixture.invoice.id}/repayments`,{idempotency_key:'production-forbidden'},tokens.ops)).status,403);
+    assert.equal((await request('GET','portal/session',undefined,tokens.ops)).data.mfa_enrolment_required,true);
+    // …and even an MFA-verified session cannot execute financial actions while the release guard is on (F22).
+    await rows('UPDATE app_sessions SET mfa_verified_at=now() WHERE token_hash=$1',[digest(tokens.ops)]);
+    assert.equal((await request('POST',`invoices/${fixture.invoice.id}/repayments`,{idempotency_key:'production-forbidden'},tokens.ops)).status,503);
+  }
   finally{Object.assign(process.env,{NODE_ENV:previous});}
 });
 test('deletes return empty 204 responses and nested mismatches are rejected',async()=>{
@@ -337,7 +357,11 @@ test('deletes return empty 204 responses and nested mismatches are rejected',asy
   assert.equal(bid.status,201);
   assert.equal((await request('GET',`invoices/${fixture.invoice.id}/bids/${bid.data.id}`,undefined,tokens.ops)).status,404);
   const result=await request('DELETE',`bids/${bid.data.id}`,undefined,tokens.financer);assert.equal(result.status,204);assert.equal(result.data,null);
-  assert.equal((await request('DELETE',`invoices/${invoice.id}`,undefined,tokens.ops)).status,204);
+  const [withdrawn]=await rows('SELECT status,portal_state FROM bids WHERE id=$1',[bid.data.id]);assert.equal(withdrawn.portal_state,'WITHDRAWN');
+  assert.ok((await rows("SELECT 1 FROM audit_events WHERE record_id=$1 AND event='bid.withdrawn'",[String(bid.data.id)])).length);
+  assert.equal((await request('DELETE',`invoices/${invoice.id}`,undefined,tokens.ops)).status,409);
+  const draft=await createInvoice('draft');
+  assert.equal((await request('DELETE',`invoices/${draft.id}`,undefined,tokens.ops)).status,204);
 });
 test('financer CRUD and sensitive user updates retain roles and revoke sessions',async()=>{
   const result=await request('POST','financers',{financer:{name:'Test lender',registration_number:'LENDER-1',institution_type:'bank',country:'GH',contact_email:'lender@example.test',email:'createdfinancer@example.test',password:'new-password-123'}},tokens.ops);
@@ -471,6 +495,8 @@ test('portal registration, email verification, onboarding and independently audi
  const review=await request('POST',`portal/verification/${onboard.data.org_ref}`,{status:'INFO_REQUIRED',note:'Provide the current tax certificate'},tokens.ops);assert.equal(review.status,200,JSON.stringify(review.data));
  const status=await request('GET','portal-auth/onboarding',undefined,token);assert.equal(status.data.review.note,'Provide the current tax certificate');
  assert.equal((await request('POST','portal-auth/onboarding',application,token)).status,200);
+ assert.equal((await request('POST',`portal/verification/${onboard.data.org_ref}`,{status:'APPROVED'},tokens.checker)).status,409);
+ for(const doc of documents)assert.equal((await request('POST',`portal/document-reviews/${doc.id}`,{decision:'verify'},tokens.ops)).status,200);
  assert.equal((await request('POST',`portal/verification/${onboard.data.org_ref}`,{status:'APPROVED'},tokens.checker)).status,200);
  assert.equal((await request('GET','portal-auth/onboarding',undefined,token)).data.review.status,'APPROVED');
  const events=await rows("SELECT * FROM portal_events WHERE event='organization.reviewed'");assert.ok(events.some(e=>e.reason==='Provide the current tax certificate'));
@@ -490,8 +516,10 @@ test('authenticator enrolment requires a password and login consumes a real one-
  const alphabet='ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';let bits='';for(const char of setup.data.secret)bits+=alphabet.indexOf(char).toString(2).padStart(5,'0');const secret=Buffer.from(bits.match(/.{8}/g)!.map(byte=>parseInt(byte,2)));const counter=Buffer.alloc(8);counter.writeBigUInt64BE(BigInt(Math.floor(Date.now()/30000)));const hash=createHmac('sha1',secret).update(counter).digest();const offset=hash[19]&15;const code=String((hash.readUInt32BE(offset)&0x7fffffff)%1000000).padStart(6,'0');
  assert.equal((await request('POST','portal-auth/mfa-enrol',{code},tokens.checker)).status,200);
  const login=await request('POST','auth/login',{email:fixture.checker.email,password:'legacy-secret'});assert.equal(login.data.mfa_required,true);assert.equal(login.data.user,undefined);const challenge=login.headers.get('set-cookie')!.match(/invox_mfa_challenge=([^;]+)/)![1];
- const verify=new NextRequest('http://localhost:3000/api/portal-auth/mfa-verify',{method:'POST',headers:{cookie:`invox_mfa_challenge=${challenge}`,'Content-Type':'application/json'},body:JSON.stringify({code})});const result=await handleRequest(verify,['portal-auth','mfa-verify']);assert.equal(result.status,200);
- const repeat=await handleRequest(new NextRequest('http://localhost:3000/api/portal-auth/mfa-verify',{method:'POST',headers:{cookie:`invox_mfa_challenge=${challenge}`},body:JSON.stringify({code})}),['portal-auth','mfa-verify']);assert.equal(repeat.status,422);
+ const verifyWith=(value:string)=>handleRequest(new NextRequest('http://localhost:3000/api/portal-auth/mfa-verify',{method:'POST',headers:{cookie:`invox_mfa_challenge=${challenge}`,'Content-Type':'application/json'},body:JSON.stringify({code:value})}),['portal-auth','mfa-verify']);
+ assert.equal((await verifyWith(code)).status,422);
+ const next=totp(secret,1);const result=await verifyWith(next);assert.equal(result.status,200);
+ const repeat=await verifyWith(next);assert.equal(repeat.status,422);
 });
 test('portal currencies NGN and KES persist without currency conversion',async()=>{
  for(const currency of ['NGN','KES']){const invoice=await request('POST','invoices',{invoice:{...invoiceFields(),programme_id:fixture.programme.id,supplier_id:fixture.supplier.id,amount:'1000.25',currency,status:'draft'}},tokens.ops);assert.equal(invoice.status,201,JSON.stringify(invoice.data));assert.equal(invoice.data.currency,currency);}

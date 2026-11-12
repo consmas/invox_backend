@@ -1,4 +1,4 @@
-import { type Actor } from './auth';
+import { type Actor, privilegedMfaRequired } from './auth';
 import { rows, type DB, type Row } from './db';
 export async function orgRef(actor: Actor, db?: DB): Promise<string | null> {
     if (actor.role === 'platform_ops')
@@ -22,5 +22,8 @@ export async function sessionData(actor: Actor) {
     const [user] = await rows('SELECT id,name,email,job_title,contact_phone,notification_preferences,email_verified_at,mfa_enrolled_at,portal_registration FROM users WHERE id=$1', [actor.id]);
     const ref = await orgRef(actor);
     const [review] = ref ? await rows('SELECT status FROM portal_org_reviews WHERE org_ref=$1', [ref]) : [];
-    return { actor, user, org_ref: ref, needs_onboarding: user.portal_registration && (!ref || review?.status !== 'APPROVED') };
+    const { mfa_verified: _verified, ...publicActor } = actor;
+    return { actor: publicActor, user, org_ref: ref, needs_onboarding: user.portal_registration && (!ref || review?.status !== 'APPROVED'),
+        // Operations sessions stay restricted to authenticator enrolment until a code has been verified.
+        mfa_enrolment_required: privilegedMfaRequired(actor), active_membership: actor.role !== 'buyer_admin' || !!actor.buyer_id };
 }

@@ -1,5 +1,15 @@
-node_modules
-.next
-.git
-.env*
-*.tsbuildinfo
+# Allowlist build context (security audit F14): everything is excluded unless listed below,
+# so database dumps, private documents, reports, test output and env files can never enter an image.
+*
+!package.json
+!pnpm-lock.yaml
+!next.config.ts
+!tsconfig.json
+!src/
+!scripts/
+!db/
+# Defence in depth inside allowed directories.
+**/*.dump
+**/*.sql.gz
+**/*.bak
+**/.env*

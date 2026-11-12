@@ -1192,7 +1192,7 @@
         "label": "Invoice number normalized",
         "type": "text",
         "required": false,
-        "readOnly": false
+        "readOnly": true
       },
       {
         "key": "payee_routing_state",

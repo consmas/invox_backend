@@ -7,6 +7,7 @@ import { id, roles, userInput, email, password, bidStatuses } from './validation
 import { appUrl, sendLink, requireMailConfiguration } from './mail';
 import { assertFinancialRelease } from './finance';
 import { audit } from './audit';
+import { assertFresh } from './context';
 import { cents,discountQuote } from './money';
 import { coreSchema,fieldSchema,fieldCatalog,rejectManagedFields,databaseValues,validateFieldReferences,entityAudit } from './fields';
 
@@ -15,6 +16,11 @@ type Input = Record<string, unknown>;
 const userProfileColumns=['name','contact_phone','country','preferred_language','timezone','recert_cycle','mfa_enrolled_at','mfa_verified_at','last_successful_login_at','dormancy_suspended_at','last_recertified_at'];
 const userColumns = ['id','email','role','buyer_id','created_at','updated_at',...userProfileColumns].join(',');
 const supplierColumns = ['id','email','email AS contact_email','user_id','invited_at','created_at','updated_at',...fieldCatalog.suppliers.fields.filter(field=>!field.transient&&field.key!=='contact_email').map(field=>`"${field.key}"`)].join(',');
+// Counterparties never receive tax, address, screening or risk assessment fields (F03).
+const supplierPartnerColumns = 'id,name,legal_name,trading_name,country,registration_number,email AS contact_email,contact_name,contact_phone,preferred_currency,created_at,updated_at';
+const supplierPublicColumns = 'id,name,legal_name,trading_name,country,created_at';
+/** Financiers see an invoice only through their own offer or a current invitation to its tender (F02). */
+const financerVisible = (user: string) => `(EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND d.financer_id=${user}) OR i.status='tender' AND EXISTS(SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=i.id AND ti.financer_id=${user}))`;
 const invoiceSelect = `SELECT i.*, p.buyer_id, p.name AS programme_name, b.name AS buyer_name,
   (SELECT d.financer_id FROM bids d WHERE d.invoice_id=i.id AND d.status=1) AS accepted_financer_id,
   json_build_object('id',s.id,'name',s.name,'email',s.email,'user_id',s.user_id) AS supplier
@@ -44,23 +50,31 @@ async function programmeFor(actor: Actor, programmeId: string, buyerId: string |
   ownBuyer(actor, record.buyer_id);
   return record;
 }
+/** Same rule as the management workflow: the supplier must be on the programme with an active buyer relationship. */
+async function requireProgrammeSupplier(programmeId: string, supplierId: string, db: DB) {
+  const [relation] = await rows(`SELECT s.id FROM suppliers s JOIN portal_programme_suppliers ps ON ps.supplier_id=s.id JOIN programmes p ON p.id=ps.programme_id
+    JOIN portal_supplier_relationships r ON r.buyer_id=p.buyer_id AND r.supplier_id=s.id AND r.status='active'
+    WHERE ps.programme_id=$1 AND s.id=$2 AND s.archived_at IS NULL`, [programmeId, supplierId], db);
+  requireCondition(relation, 422, 'Add this supplier to the programme before creating an invoice');
+}
 function serializeUser(record: Row) { const safe=Object.fromEntries(['id','email','role','buyer_id','created_at','updated_at',...userProfileColumns].filter(key=>record[key]!==undefined).map(key=>[key,record[key]]));return { ...safe, ...publicUser(record) }; }
 function serializeBid(record: Row) { return { ...record,offered_financing_amount:record.amount,financier_id:record.financer_id,status:bidStatuses[record.status] }; }
 function invoiceAccess(actor: Actor, invoice: Row, write = false) {
   if (actor.role === 'platform_ops') return;
   if (actor.role === 'buyer_admin' && same(actor.buyer_id, invoice.buyer_id)) return;
   if (!write && actor.role === 'supplier_user' && same(actor.id, invoice.supplier.user_id)) return;
-  if (!write && actor.role === 'financer' && (invoice.status === 'tender' || invoice.has_own_bid)) return;
+  if (!write && actor.role === 'financer' && (invoice.has_own_bid || invoice.status === 'tender' && invoice.invited)) return;
   throw new ApiError(403, 'Forbidden');
 }
 async function invoiceFor(actor: Actor, invoiceId: string, buyerId: string | undefined, db: DB, write = false): Promise<Row> {
   const record = found((await rows(`${invoiceSelect} WHERE i.id=$1`, [invoiceId], db))[0]);
-  record.has_own_bid = (await rows('SELECT EXISTS(SELECT 1 FROM bids WHERE invoice_id=$1 AND financer_id=$2) AS own', [invoiceId, actor.id], db))[0].own;
+  const [visibility] = await rows(`SELECT EXISTS(SELECT 1 FROM bids WHERE invoice_id=$1 AND financer_id=$2) AS own,
+    EXISTS(SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=$1 AND ti.financer_id=$2) AS invited`, [invoiceId, actor.id], db);
+  record.has_own_bid = visibility.own; record.invited = visibility.invited;
   requireCondition(!record.deleted_at,404,'Invoice not found');
   if (buyerId) requireCondition(same(record.buyer_id, buyerId), 404, 'Not found');
   invoiceAccess(actor, record, write);
-  if(actor.role==='financer'){const tenders=await rows('SELECT t.id FROM financing_tenders t WHERE t.invoice_id=$1',[invoiceId],db);if(tenders.length)requireCondition((await rows('SELECT 1 FROM portal_tender_invitations WHERE tender_id=ANY($1::bigint[]) AND financer_id=$2',[tenders.map(t=>t.id),actor.id],db)).length,403,'This tender is invitation only');}
-  delete record.has_own_bid;
+  delete record.has_own_bid; delete record.invited;
   return record;
 }
 function invoiceFilter(actor: Actor, values: unknown[]): string {
@@ -69,7 +83,8 @@ function invoiceFilter(actor: Actor, values: unknown[]): string {
   values.push(actor.id);
   const user = `$${values.length}`;
   if (actor.role === 'supplier_user') return `s.user_id=${user}`;
-  return `(i.status='tender' OR EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND d.financer_id=${user}))`;
+  if (actor.role === 'financer') return financerVisible(user);
+  return 'FALSE';
 }
 export async function invoiceList(actor: Actor, buyerId?: string, programmeId?: string, db: DB = pool(), includeDeleted=false) {
   const values: unknown[] = [];
@@ -77,7 +92,6 @@ export async function invoiceList(actor: Actor, buyerId?: string, programmeId?: 
   if(!includeDeleted)where.push('i.deleted_at IS NULL');
   if (buyerId) { await buyerFor(actor, buyerId, db); values.push(buyerId); where.push(`p.buyer_id=$${values.length}`); }
   if (programmeId) { await programmeFor(actor, programmeId, buyerId, db); values.push(programmeId); where.push(`i.programme_id=$${values.length}`); }
-  if(actor.role==='financer'){values.push(actor.id);where.push(`(NOT EXISTS(SELECT 1 FROM financing_tenders t WHERE t.invoice_id=i.id) OR EXISTS(SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=i.id AND ti.financer_id=$${values.length}))`);}
   return rows(`${invoiceSelect} WHERE ${where.join(' AND ')} ORDER BY i.id DESC`, values, db);
 }
 async function buyerJson(buyerId: string, db: DB) {
@@ -86,7 +100,15 @@ async function buyerJson(buyerId: string, db: DB) {
   return { ...buyer, users: users.map(serializeUser) };
 }
 
+/** One lock for every change to the operations administrator set; the count is rechecked after acquiring it. */
+export async function lockOperatorSet(db: DB) { await rows('SELECT pg_advisory_xact_lock(72482904)', [], db); }
+export async function requireOtherOperator(userId: string, db: DB) {
+  await lockOperatorSet(db);
+  const others = await rows('SELECT id FROM users WHERE role=2 AND disabled_at IS NULL AND id<>$1', [userId], db);
+  requireCondition(others.length > 0, 409, 'Cannot remove the last platform operator');
+}
 async function saveUser(data: Input, actor: Actor, db: DB, userId?: string, buyerId?: string): Promise<Row> {
+  if (userId && actor.role === 'platform_ops') await lockOperatorSet(db);
   const previous = userId ? found((await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE', [userId], db))[0]) : undefined;
   const normalized: Input = { ...data, buyer_id: data.buyer_id === '' ? null : data.buyer_id };
   if (normalized.buyer_id === undefined && previous) normalized.buyer_id = previous.buyer_id;
@@ -103,11 +125,8 @@ async function saveUser(data: Input, actor: Actor, db: DB, userId?: string, buye
   }
   if (targetBuyer) found((await rows('SELECT id FROM buyers WHERE id=$1', [targetBuyer], db))[0]);
   if (previous && same(previous.id, actor.id)) requireCondition(role === actor.role, 422, 'You cannot change your own role');
-  // Protect the last operations account against accidental lockout.
-  if (previous?.role === 2 && role !== 'platform_ops') {
-    const others = await rows('SELECT id FROM users WHERE role=2 AND id<>$1', [previous.id], db);
-    requireCondition(others.length > 0, 409, 'Cannot remove the last platform operator');
-  }
+  // Protect the last operations account against lockout, including concurrent demotions (F07).
+  if (previous?.role === 2 && role !== 'platform_ops') await requireOtherOperator(String(previous.id), db);
   const attrs: Input = { role: roles.indexOf(role), buyer_id: targetBuyer };
   if (parsed.email !== undefined) attrs.email = parsed.email;
   for(const key of ['name','contact_phone','country','preferred_language','timezone','recert_cycle'] as const)if(parsed[key]!==undefined)attrs[key]=parsed[key];
@@ -130,9 +149,11 @@ async function nestedUsers(body: Input, buyerId: string, actor: Actor, db: DB) {
     if (entry._destroy === true || entry._destroy === '1') {
       requireCondition(userId, 422, 'User ID is required');
       requireCondition(!same(userId, actor.id), 422, 'You cannot remove your own access');
-      // Removing a buyer membership preserves historical invoice and bid records.
-      await update('users', userId, { buyer_id: null }, db);
+      // Removing a buyer membership preserves historical records but disables the account: an account
+      // without a tenant must never fall back to a broader scope (F01).
+      await update('users', userId, { buyer_id: null, disabled_at: new Date() }, db);
       await revokeSessions(userId, db);
+      await entityAudit(db,actor,'users',userId,'membership_removed',{buyer_id:buyerId},{buyer_id:null,disabled:true});
     } else await saveUser(entry, actor, db, userId, buyerId);
   }
 }
@@ -160,7 +181,9 @@ async function buyers(actor: Actor, method: string, buyerId: string | undefined,
     if (method === 'PATCH' || method === 'PUT') {
       const input = payload(body, 'buyer');
       rejectManagedFields('buyers',input);
+      await rows('SELECT id FROM buyers WHERE id=$1 FOR UPDATE',[buyerId],db);
       const previous=await buyerJson(buyerId,db);
+      assertFresh(previous as Row);
       const buyer=await update('buyers', buyerId, databaseValues('buyers',coreSchema('buyers',true).parse(input)), db);
       await entityAudit(db,actor,'buyers',buyerId,'updated',previous,buyer);
       await nestedUsers(input, buyerId, actor, db);
@@ -170,9 +193,12 @@ async function buyers(actor: Actor, method: string, buyerId: string | undefined,
       requireRole(actor, 'platform_ops');
       const dependencies = await rows('SELECT id FROM programmes WHERE buyer_id=$1 LIMIT 1', [buyerId], db);
       requireCondition(dependencies.length === 0, 409, 'Delete this buyer’s programmes before deleting the buyer');
-      await rows('DELETE FROM app_sessions WHERE user_id IN (SELECT id FROM users WHERE buyer_id=$1)', [buyerId], db);
-      await rows('UPDATE users SET buyer_id=NULL,updated_at=now() WHERE buyer_id=$1', [buyerId], db);
+      const members = await rows('SELECT id FROM users WHERE buyer_id=$1', [buyerId], db);
+      const before = await buyerJson(buyerId, db);
+      for (const member of members) await revokeSessions(String(member.id), db);
+      await rows('UPDATE users SET buyer_id=NULL,disabled_at=coalesce(disabled_at,now()),updated_at=now() WHERE buyer_id=$1', [buyerId], db);
       await rows('DELETE FROM buyers WHERE id=$1', [buyerId], db);
+      await entityAudit(db,actor,'buyers',buyerId,'deleted',before,null);
       return { status: 204 };
     }
     throw new ApiError(405, 'Method not allowed');
@@ -203,6 +229,7 @@ async function programmes(actor: Actor, method: string, buyerId: string | undefi
     }
     requireCondition(programmeId && previous, 405, 'Method not allowed');
     if (method === 'PATCH' || method === 'PUT') {
+      assertFresh(previous);
       requireCondition(!previous.archived_at&&(!previous.status||['draft','paused'].includes(previous.status)),409,'Pause the programme before editing released terms; submitted configurations are locked');
       const input=payload(body,'programme');rejectManagedFields('programmes',input);
       const data=coreSchema('programmes',true).parse(input);await validateFieldReferences('programmes',data,actor,db);
@@ -213,7 +240,10 @@ async function programmes(actor: Actor, method: string, buyerId: string | undefi
     if (method === 'DELETE') {
       requireCondition(!previous.archived_at&&(!previous.status||previous.status==='draft'),409,'Archive released programmes to preserve their history');
       requireCondition(!(await rows('SELECT id FROM invoices WHERE programme_id=$1 LIMIT 1', [programmeId], db)).length, 409, 'Delete this programme’s invoices first');
+      await rows('DELETE FROM portal_programme_suppliers WHERE programme_id=$1', [programmeId], db);
+      await rows('DELETE FROM portal_programme_financiers WHERE programme_id=$1', [programmeId], db);
       await rows('DELETE FROM programmes WHERE id=$1', [programmeId], db);
+      await entityAudit(db,actor,'programmes',programmeId,'deleted',previous,null);
       return { status: 204 };
     }
     throw new ApiError(405, 'Method not allowed');
@@ -231,8 +261,9 @@ async function invoices(actor: Actor, method: string, buyerId: string | undefine
       validateInvoiceFields(data);
       await validateFieldReferences('invoices',data,actor,db);
       await programmeFor(actor, data.programme_id, buyerId, db);
-      found((await rows('SELECT id FROM suppliers WHERE id=$1', [data.supplier_id], db))[0]);
-      requireCondition(['draft', 'approved', 'tender'].includes(data.status), 422, 'New invoices cannot be funded or repaid');
+      await requireProgrammeSupplier(data.programme_id, data.supplier_id, db);
+      // Status is server-controlled: approval and tender come only from the supplier approval and tender workflows (F04).
+      requireCondition(data.status === 'draft', 409, 'New invoices start as drafts. Use the submission and tender workflow to change their status.');
       const invoice = await insert('invoices', databaseValues('invoices',data), db);
       await entityAudit(db,actor,'invoices',String(invoice.id),'created',null,invoice);
       return { data: await invoiceFor(actor, String(invoice.id), buyerId, db), status: 201 };
@@ -247,22 +278,24 @@ async function invoices(actor: Actor, method: string, buyerId: string | undefine
       requireCondition(!['pending','approved'].includes(previous.invoice_approval_status),409,'Withdraw the submission before deleting this invoice');
       requireCondition(!(await rows('SELECT id FROM bids WHERE invoice_id=$1 LIMIT 1',[invoiceId],db)).length,409,'Invoices with offer history cannot be deleted');
       await rows('UPDATE invoices SET deleted_at=now(),updated_at=now() WHERE id=$1', [invoiceId], db);
+      await entityAudit(db,actor,'invoices',invoiceId,'deleted',previous,null);
       return { status: 204 };
     }
     if (method === 'PATCH' || method === 'PUT') {
+      assertFresh(previous);
       requireCondition(!['pending','approved'].includes(previous.invoice_approval_status),409,'Withdraw the submission or approval before changing invoice terms');
       const input=payload(body,'invoice');rejectManagedFields('invoices',input);
       const data=coreSchema('invoices',true).parse(input);
       validateInvoiceFields({...previous,...data});await validateFieldReferences('invoices',data,actor,db);
-      const status = data.status ?? previous.status;
-      if(previous.submitted_for_approval_at&&['approved','tender'].includes(status))requireCondition(previous.invoice_approval_status==='approved',409,'Supplier approval is required');
-      const transitions: Record<string, string[]> = { draft: ['draft','approved'], approved: ['approved','draft','tender'], tender: ['tender'], funded: ['funded'], repaid: ['repaid'] };
-      requireCondition(transitions[previous.status]?.includes(status), 409, 'Invalid invoice status transition');
-      if (['funded', 'repaid'].includes(previous.status)) requireCondition(Object.keys(data).every(key => key === 'status'), 409, 'Funded invoice details are immutable');
+      // Compatibility routes edit terms only. Every status change goes through the domain workflow, which
+      // enforces supplier approval, tender publication and invitations (F04).
+      if (input.status !== undefined) requireCondition(data.status === previous.status, 409, 'Invoice status changes use the submission, approval and tender workflow');
+      delete (data as Row).status;
+      if (['funded', 'repaid', 'tender', 'cancelled'].includes(previous.status)) requireCondition(Object.keys(data).length === 0, 409, 'Invoice details are locked in its current status');
       const hasBids = (await rows('SELECT id FROM bids WHERE invoice_id=$1 LIMIT 1', [invoiceId], db)).length > 0;
-      if (hasBids) requireCondition(Object.keys(data).every(key => key==='status'), 409, 'Invoice terms cannot change after bidding starts');
+      if (hasBids) requireCondition(Object.keys(data).length === 0, 409, 'Invoice terms cannot change after bidding starts');
       await programmeFor(actor, data.programme_id ?? String(previous.programme_id), buyerId, db);
-      if (data.supplier_id) found((await rows('SELECT id FROM suppliers WHERE id=$1', [data.supplier_id], db))[0]);
+      if (data.supplier_id || data.programme_id) await requireProgrammeSupplier(data.programme_id ?? String(previous.programme_id), data.supplier_id ?? String(previous.supplier_id), db);
       const record=await update('invoices', invoiceId, databaseValues('invoices',data), db);
       await entityAudit(db,actor,'invoices',invoiceId,'updated',previous,record);
       return { data: await invoiceFor(actor, invoiceId, buyerId, db) };
@@ -307,13 +340,16 @@ async function bids(actor: Actor, method: string, invoiceId: string | undefined,
       requireCondition(!invoice.financial_review_required,409,'Legacy invoice requires review');
       requireCondition(!(await rows('SELECT id FROM bids WHERE invoice_id=$1 AND status=1',[target],db)).length,409,'An offer has already been selected');
       rejectManagedFields('bids',input);
+      // Financing needs a published, open tender to which this financier is invited (F04).
       const [openTender]=await rows('SELECT * FROM financing_tenders WHERE invoice_id=$1 ORDER BY id DESC LIMIT 1',[target],db);
-      if(openTender)requireCondition(openTender.status==='open'&&new Date(openTender.closes_at).getTime()>Date.now(),409,'Tender is closed');
+      requireCondition(openTender&&openTender.status==='open'&&new Date(openTender.closes_at).getTime()>Date.now(),409,'Tender is closed');
+      requireCondition((await rows('SELECT 1 FROM portal_tender_invitations WHERE tender_id=$1 AND financer_id=$2',[openTender.id,actor.id],db)).length,403,'This tender is invitation only');
       const data = coreSchema('bids').parse(input);
       const priced=priceBid(data,invoice);
       validateBid({...priced,amount:String(priced.amount),expiry_date:priced.expiry_date as string|null}, invoice);
       requireCondition(!(await rows('SELECT id FROM bids WHERE invoice_id=$1 AND financer_id=$2 AND status IN (0,1)', [target, actor.id], db)).length, 409, 'You already have an active bid on this invoice');
       const bid = await insert('bids', { ...databaseValues('bids',priced), invoice_id: target, financer_id: actor.id, status: 0 }, db);
+      await audit(db,actor,String(target),'bid.submitted','bid',String(bid.id),{after:bid});
       return { data: serializeBid(bid), status: 201 };
     }
     requireCondition(bidId, 405, 'Method not allowed');
@@ -335,16 +371,27 @@ async function bids(actor: Actor, method: string, invoiceId: string | undefined,
         requireCondition(!(await rows('SELECT id FROM invoices WHERE id=$1 AND financial_review_required',[bid.invoice_id],db)).length,409,'Legacy invoice requires review');
         requireCondition(!bid.expiry_date || String(bid.expiry_date).slice(0, 10) >= new Date().toISOString().slice(0, 10), 409, 'Bid has expired');
         requireCondition(!bid.expires_at||Date.parse(bid.expires_at)>Date.now(),409,'Bid has expired');
+        requireCondition((await rows("SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=$1 AND t.status='open' AND ti.financer_id=$2",[bid.invoice_id,bid.financer_id],db)).length,409,'Only offers from invited financiers on an open tender can be accepted');
         await update('bids', bidId, { status: 1 }, db);
         await rows("UPDATE financing_tenders SET status='awarded',accepted_bid_id=$2 WHERE invoice_id=$1 AND status='open'",[bid.invoice_id,bidId],db);
         await rows('UPDATE bids SET status=2,updated_at=now() WHERE invoice_id=$1 AND id<>$2 AND status=0', [bid.invoice_id, bidId], db);
         await audit(db,actor,String(bid.invoice_id),'bid.accepted','bid',bidId,{before:{status:'pending'},after:{status:'accepted'},invoice_status:'tender',competing_pending_offers:'rejected'});
-      } else await update('bids', bidId, { status: 2 }, db);
+      } else {
+        await update('bids', bidId, { status: 2 }, db);
+        await audit(db,actor,String(bid.invoice_id),'bid.rejected','bid',bidId,{before:{status:'pending'},after:{status:'rejected'}});
+      }
       return { data: serializeBid(found((await rows(`${bidSelect} WHERE d.id=$1`, [bidId], db))[0])) };
     }
     requireCondition(actor.role === 'platform_ops' || actor.role === 'financer' && same(actor.id, bid.financer_id), 403, 'Forbidden');
-    if (method === 'DELETE') { await rows('DELETE FROM bids WHERE id=$1', [bidId], db); return { status: 204 }; }
+    if (method === 'DELETE') {
+      // Only unsubmitted drafts are erased; a submitted offer is withdrawn so its history remains (F19).
+      if (bid.portal_state === 'DRAFT') await rows('DELETE FROM bids WHERE id=$1', [bidId], db);
+      else await rows("UPDATE bids SET status=2,portal_state='WITHDRAWN',updated_at=now() WHERE id=$1", [bidId], db);
+      await audit(db,actor,String(bid.invoice_id),bid.portal_state === 'DRAFT' ? 'bid.draft_deleted' : 'bid.withdrawn','bid',bidId,{before:bid});
+      return { status: 204 };
+    }
     if (method === 'PATCH' || method === 'PUT') {
+      assertFresh(bid);
       const input=payload(body,'bid');rejectManagedFields('bids',input);
       const data=coreSchema('bids',true).parse(input);
       const invoice=await invoiceFor(actor,String(bid.invoice_id),buyerId,db);
@@ -352,7 +399,9 @@ async function bids(actor: Actor, method: string, invoiceId: string | undefined,
       validateBid({amount:String(priced.amount),expiry_date:priced.expiry_date},invoice);
       const writable=Object.fromEntries(fieldCatalog.bids.fields.filter(field=>!field.readOnly&&!field.transient).filter(field=>priced[field.key]!==undefined).map(field=>[field.key,priced[field.key]]));
       const values={...writable,requested_financing_amount:priced.requested_financing_amount,net_supplier_proceeds:priced.net_supplier_proceeds,pricing_snapshot:priced.pricing_snapshot};
-      return {data:serializeBid(await update('bids',bidId,databaseValues('bids',values),db))};
+      const updated=await update('bids',bidId,databaseValues('bids',values),db);
+      await audit(db,actor,String(bid.invoice_id),'bid.updated','bid',bidId,{before:bid,after:updated});
+      return {data:serializeBid(updated)};
     }
     throw new ApiError(405, 'Method not allowed');
   });
@@ -409,8 +458,11 @@ async function users(actor: Actor, method: string, userId: string | undefined, b
       return {data:financerOnly?await financierJson(user,db):serializeUser(user),status:201};
     }
     requireCondition(userId, 405, 'Method not allowed');
+    // Take the administrator-set lock before any row lock so concurrent role changes cannot deadlock or race.
+    await lockOperatorSet(db);
     const previous = found((await rows(`SELECT * FROM users WHERE id=$1 ${financerOnly ? 'AND role=3' : ''} FOR UPDATE`, [userId], db))[0]);
     if (method === 'PATCH' || method === 'PUT') {
+      assertFresh(previous);
       if(financerOnly)rejectManagedFields('financers',input);
       const profile=financerOnly?fieldSchema('financers',true,{exclude:['email']}).parse(input):null;
       const user=await saveUser(input,actor,db,userId);
@@ -419,10 +471,13 @@ async function users(actor: Actor, method: string, userId: string | undefined, b
     }
     if (method === 'DELETE') {
       requireCondition(!same(actor.id, userId), 422, 'You cannot delete your own account');
-      if (previous.role === 2) requireCondition((await rows('SELECT id FROM users WHERE role=2 AND id<>$1', [userId], db)).length, 409, 'Cannot remove the last platform operator');
+      if (previous.role === 2) await requireOtherOperator(userId, db);
       requireCondition(!(await rows('SELECT id FROM bids WHERE financer_id=$1 UNION ALL SELECT id FROM suppliers WHERE user_id=$1 LIMIT 1', [userId], db)).length, 409, 'Account has financial records and cannot be deleted');
+      await rows('DELETE FROM portal_mfa_challenges WHERE user_id=$1',[userId],db);
+      await rows('DELETE FROM app_sessions WHERE user_id=$1',[userId],db);
       await rows('DELETE FROM financier_profiles WHERE user_id=$1',[userId],db);
       await rows('DELETE FROM users WHERE id=$1', [userId], db);
+      await entityAudit(db,actor,financerOnly?'financers':'users',userId,'deleted',serializeUser(previous),null);
       return { status: 204 };
     }
     throw new ApiError(405, 'Method not allowed');
@@ -436,14 +491,22 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
     if (method === 'GET') {
       const values: unknown[] = [];
       const where: string[] = [];
+      // Profiles are scoped to the supplier's own account, the buyer's active relationships, or invoices a
+      // financier may see; counterparties get a reduced column set (F03).
+      let columns = supplierColumns;
       if (actor.role === 'supplier_user') { values.push(actor.id); where.push(`user_id=$${values.length}`); }
-      // Buyer admins may select an onboarded supplier when creating their own invoices.
-      if (actor.role === 'financer') {
+      else if (actor.role === 'buyer_admin') {
+        requireCondition(actor.buyer_id, 403, 'Your account is not linked to an active organisation');
+        values.push(actor.buyer_id);
+        where.push(`id IN (SELECT r.supplier_id FROM portal_supplier_relationships r WHERE r.buyer_id=$${values.length} AND r.status='active')`);
+        columns = supplierPartnerColumns;
+      } else if (actor.role === 'financer') {
         values.push(actor.id);
-        where.push(`id IN (SELECT i.supplier_id FROM invoices i WHERE i.status='tender' OR EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND d.financer_id=$${values.length}))`);
-      }
+        where.push(`id IN (SELECT i.supplier_id FROM invoices i WHERE ${financerVisible(`$${values.length}`)})`);
+        columns = supplierPublicColumns;
+      } else if (actor.role !== 'platform_ops') where.push('FALSE');
       if (supplierId) { values.push(supplierId); where.push(`id=$${values.length}`); }
-      const list = await rows(`SELECT ${supplierColumns} FROM suppliers ${where.length ? 'WHERE '+where.join(' AND ') : ''} ORDER BY id`, values, db);
+      const list = await rows(`SELECT ${columns} FROM suppliers ${where.length ? 'WHERE '+where.join(' AND ') : ''} ORDER BY id`, values, db);
       return { data: supplierId ? found(list[0]) : list };
     }
     requireRole(actor, 'platform_ops');
@@ -483,6 +546,7 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
       return {data:(await rows(`SELECT ${supplierColumns} FROM suppliers WHERE id=$1`,[supplierId],db))[0]};
     }
     if (method === 'PATCH' || method === 'PUT') {
+      assertFresh(previous);
       rejectManagedFields('suppliers',raw);
       const data=fieldSchema('suppliers',true).parse({...raw,contact_email:raw.contact_email??raw.email});
       const { contact_email, ...attrs } = data;
@@ -496,7 +560,10 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
     }
     if (method === 'DELETE') {
       requireCondition(!(await rows('SELECT id FROM invoices WHERE supplier_id=$1 LIMIT 1', [supplierId], db)).length, 409, 'Supplier has invoices and cannot be deleted');
+      await rows('DELETE FROM portal_programme_suppliers WHERE supplier_id=$1', [supplierId], db);
+      await rows('DELETE FROM portal_supplier_relationships WHERE supplier_id=$1', [supplierId], db);
       await rows('DELETE FROM suppliers WHERE id=$1', [supplierId], db);
+      await entityAudit(db,actor,'suppliers',supplierId,'deleted',previous,null);
       return { status: 204 };
     }
     throw new ApiError(405, 'Method not allowed');
@@ -517,7 +584,10 @@ async function financerData(actor: Actor, financerId: string, action: string): P
   requireCondition(actor.role === 'platform_ops' || actor.role === 'financer' && same(actor.id, financerId), 403, 'Forbidden');
   found((await rows('SELECT id FROM users WHERE id=$1 AND role=3', [financerId]))[0]);
   if (action === 'bids') return bids(actor, 'GET', undefined, undefined, undefined, undefined, financerId, {});
-  if (action === 'opportunities') return { data: await rows(`${invoiceSelect} WHERE i.status='tender' AND i.financing_eligible=true AND i.currency IS NOT NULL AND NOT i.financial_review_required AND NOT EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND (d.status=1 OR d.financer_id=$1 AND d.status=0)) ORDER BY i.id DESC`, [financerId]) };
+  // Opportunities are open tenders this financier is invited to; the same visibility rule as every invoice read (F02).
+  if (action === 'opportunities') return { data: await rows(`${invoiceSelect} WHERE i.status='tender' AND i.deleted_at IS NULL AND i.financing_eligible=true AND i.currency IS NOT NULL AND NOT i.financial_review_required
+    AND EXISTS(SELECT 1 FROM financing_tenders t JOIN portal_tender_invitations ti ON ti.tender_id=t.id WHERE t.invoice_id=i.id AND t.status='open' AND t.closes_at>now() AND ti.financer_id=$1)
+    AND NOT EXISTS(SELECT 1 FROM bids d WHERE d.invoice_id=i.id AND (d.status=1 OR d.financer_id=$1 AND d.status=0)) ORDER BY i.id DESC`, [financerId]) };
   if (action === 'portfolio') return { data: await rows(`${invoiceSelect} WHERE EXISTS(SELECT 1 FROM bids d JOIN fundings f ON f.invoice_id=d.invoice_id WHERE d.invoice_id=i.id AND d.financer_id=$1 AND d.status=1 AND f.status='completed') ORDER BY i.id DESC`, [financerId]) };
   throw new ApiError(404, 'Not found');
 }

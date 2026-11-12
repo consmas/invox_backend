@@ -13,7 +13,11 @@ export function requireMailConfiguration() {
 }
 export async function sendLink(email: string, subject: string, url: string): Promise<{ preview_url?: string }> {
   requireMailConfiguration();
-  if (!process.env.SMTP_URL) return { preview_url: url }; // Returned only to the authorized caller in development.
+  if (!process.env.SMTP_URL) {
+    // Link previews exist for local development only; any other environment must deliver real email.
+    if (!['development', 'test'].includes(process.env.NODE_ENV ?? '')) throw new ApiError(503, 'Email delivery is not configured');
+    return { preview_url: url };
+  }
   await nodemailer.createTransport(process.env.SMTP_URL).sendMail({
     from: process.env.MAIL_FROM || 'Invoix <no-reply@localhost>', to: email, subject,
     text: `${subject}\n\n${url}\n\nIf you did not request this, you can ignore this email.`,

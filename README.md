@@ -53,11 +53,13 @@ Authentication uses a random token in the HttpOnly `invoix_token` cookie, or `Au
 
 ## Authorization and financial rules
 
-Operations administers all resources. Buyer admins manage their own buyer/programmes/invoices and may assign only buyer/supplier roles within that buyer. Supplier accounts read their own invoices and associated bids. Financers see tendered invoices and invoices on which they bid, and only their own bids and portfolio. User profile access is self or operations; account CRUD is operations-only.
+Operations administers all resources. Buyer admins manage their own buyer/programmes/invoices and may assign only buyer/supplier roles within that buyer. A buyer role without an active buyer membership is refused, never widened; removing a membership disables the account. Accounts awaiting organisation approval can use only their own onboarding (session, profile, notifications, uploads). Supplier accounts read their own invoices and associated bids. Financers see an invoice only through their own offer or a current invitation to its tender, and only their own bids and portfolio. Supplier profiles are visible to the supplier, to buyers with an active relationship (without tax, address, screening or risk fields) and minimally to financiers on invoices they can see. User profile access is self or operations; account CRUD is operations-only.
 
-Invoice transitions follow `draft → approved → tender → funded → repaid`; approved can return to draft. New invoices may start in draft, approved, or tender. Funding occurs only after independently verified disbursement evidence. Terms become immutable after bidding begins; funded/repaid details cannot change. Monetary inputs must be positive and use at most two decimal places.
+Invoice status is server-controlled: every route, including `/api/v1` compatibility routes, creates drafts only, and approval and tender come exclusively from supplier approval (`portal/invoices/:id/submit|decide`) and tender publication (`portal/tenders`). Compatibility PATCH routes edit draft terms only. Funding occurs only after independently verified disbursement evidence. Monetary inputs must be positive and use at most two decimal places. One active invoice per buyer, supplier and invoice reference (case and whitespace insensitive) is enforced across all of the buyer's programmes.
 
-Only financers place bids on tendered invoices and edit/withdraw their own pending bids. Buyer admins for that invoice or operations can accept/reject. Acceptance locks the invoice and the winning offer, closes other pending bids, and leaves the invoice awaiting verified disbursement. It does not mark the invoice funded. A partial unique index independently prevents multiple accepted bids. Deletes with financial dependencies return 409.
+Only invited financers place bids, on an open published tender. They edit their own pending bids; deleting a submitted bid withdraws it (drafts are erased). Buyer admins for that invoice or operations can accept/reject offers from invited financiers on an open tender. Acceptance locks the invoice and the winning offer, closes other pending bids, and leaves the invoice awaiting verified disbursement. It does not mark the invoice funded. A partial unique index independently prevents multiple accepted bids. Deletes with financial dependencies return 409.
+
+Edits may send `X-Expected-Updated-At` with the `updated_at` value the client loaded; if the record changed since, the server returns 409 instead of overwriting it.
 
 ## Live connection check
 
@@ -74,7 +76,27 @@ With both apps running against a disposable local database and a disposable oper
 - `scripts/`: migration, operator provisioning, maintenance.
 - `tests/`: isolated PostgreSQL integration tests.
 
-For remote PostgreSQL, use certificate verification (`sslmode=verify-full` and the proper CA certificate in `DATABASE_URL`). Keep environment files and database dumps out of source control.
+For remote PostgreSQL, use certificate verification: either `DATABASE_CA_CERT` (the PEM contents, convenient on DigitalOcean App Platform) or `sslmode=verify-full&sslrootcert=<file>` in `DATABASE_URL`. Keep environment files and database dumps out of source control and out of the Docker build context (the `.dockerignore` is an allowlist).
+
+## Production security configuration
+
+| Variable | Purpose |
+| --- | --- |
+| `DATABASE_URL` | Runtime connection. In production use the restricted role from `db/roles/runtime-role.sql`, not the owner. |
+| `MIGRATION_DATABASE_URL` | Owner connection used only by `pnpm db:migrate` (release job). |
+| `DATABASE_CA_CERT` | PEM of the managed database CA; enables full certificate verification. |
+| `DATABASE_POOL_MAX`, `DATABASE_STATEMENT_TIMEOUT_MS`, `DATABASE_LOCK_TIMEOUT_MS`, `DATABASE_IDLE_TX_TIMEOUT_MS` | Pool size and server-side deadlines (defaults 10, 15 s, 5 s, 30 s). Saturation returns 503 with `Retry-After`. |
+| `CLIENT_IP_HEADER` | Header set by your trusted edge carrying the client IP (`do-connecting-ip` on DigitalOcean App Platform). Enables per-network limits. Unset = one shared bucket; caller-supplied `X-Forwarded-For` is never trusted. |
+| `DOCUMENT_STORAGE_DRIVER=s3`, `S3_BUCKET`, `S3_REGION`, `S3_ENDPOINT`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_PREFIX` | Private shared object storage (e.g. DigitalOcean Spaces: `S3_ENDPOINT=https://<region>.digitaloceanspaces.com`). Required when more than one instance runs or the filesystem is ephemeral (App Platform). Otherwise `DOCUMENT_STORAGE_PATH` must be a persistent volume. |
+| `DOCUMENT_QUOTA_BYTES`, `DOCUMENT_DAILY_LIMIT`, `DOCUMENT_UPLOAD_CONCURRENCY` | Per-account storage allowance (250 MB), uploads per day (100), concurrent uploads per instance (4). |
+| `BCRYPT_CONCURRENCY`, `BCRYPT_QUEUE` | Concurrent password hashes per instance (4) and waiting requests before 503 (64). |
+| `REQUIRE_OPERATIONS_MFA` | Operations MFA is always enforced in production; set `true` to enforce it elsewhere. |
+
+Operations accounts in production receive an enrolment-only session until an authenticator is enrolled and verified (`/mfa-setup` in the frontend). Pending MFA challenges are bound to the credential epoch and die on password change, reset or session revocation; each authenticator code (time step) is accepted once.
+
+Request bodies are capped while streaming (1 MB JSON, 10 MB files). Uploaded files start as `scan_status=pending` / `review_status=pending`; only operations review makes them accepted evidence for organisation approval and conditions precedent. Automated malware scanning is not built in; place uploads behind a scanning service before treating them as safe to open.
+
+Schedule `pnpm db:cleanup` (expired sessions, rate-limit counters, bids). Keep the financial release guard (`NODE_ENV=production`) in place until the controls in `docs/DEVELOPMENT.md` are implemented and independently tested.
 
 ## Financial foundation increment
 

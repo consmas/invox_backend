@@ -16,6 +16,7 @@
     "test:http": "node tests/http-smoke.mjs"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.1167.0",
     "@next/env": "15.5.29",
     "bcryptjs": "^3.0.2",
     "next": "15.5.29",
@@ -39,5 +40,10 @@
   },
   "engines": {
     "node": ">=22.0.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "postcss": "^8.5.23"
+    }
   }
 }

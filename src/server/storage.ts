@@ -52,5 +52,6 @@ function s3Driver(): Driver {
   };
 }
 export function documentStorage(): Driver {
-  return process.env.DOCUMENT_STORAGE_DRIVER === 's3' ? s3Driver() : localDriver();
+  // 'spaces' (DigitalOcean Spaces) and 's3' use the same S3-compatible driver.
+  return ['s3', 'spaces'].includes(process.env.DOCUMENT_STORAGE_DRIVER ?? '') ? s3Driver() : localDriver();
 }

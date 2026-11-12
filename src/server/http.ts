@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { z } from 'zod';
-import { authenticate, verifyOrigin, privilegedMfaRequired, type Actor } from './auth';
+import { authenticate, verifyOrigin, privilegedMfaRequired, actorForToken, requestToken, type Actor } from './auth';
+import { ACT_FOR_COOKIE, delegatedActor, recordDelegatedAction, emailRecipients, startActing, setActForCookie, registerOrganisation, sendAccountSetup } from './act-for';
 import { authRequest } from './auth-routes';
 import { ApiError } from './errors';
 import { resourceRequest } from './resources';
-import { rows } from './db';
+import { rows, transaction } from './db';
 import { financeRequest } from './finance';
 import {portalRequest,sessionData} from './portal';
 import {portalAuth} from './portal-auth';
@@ -68,6 +69,72 @@ function transient(error: unknown) {
   return ['57014','55P03','53300','40001','40P01','57P01','ECONNREFUSED','ECONNRESET','ETIMEDOUT','ENOTFOUND','EAI_AGAIN'].includes(code) || /timeout exceeded when trying to connect|connection timeout/i.test(message);
 }
 
+async function route(actor: Actor, req: NextRequest, path: string[], body: Record<string, unknown>): Promise<{status?:number;data?:unknown}> {
+  if(req.headers.has('idempotency-key'))body.idempotency_key=req.headers.get('idempotency-key');
+  const financial=['agreements','fundings','repayments'].includes(path[0])||path[0]==='invoices'&&['financials','agreements','fundings','repayments'].includes(path[2]);
+  return path[0]==='portal'?await portalRequest(actor,req.method,path,body):path[0]==='field-definitions'&&req.method==='GET'?await definitions(actor,path)
+    :path[0]==='lookups'&&path.length===2&&req.method==='GET'?await lookup(actor,path[1])
+    :path[0]==='controls'?await controlRecords(actor,req.method,path,body)
+    :financial?await financeRequest(actor,req.method,path,body):await resourceRequest(actor,req.method,path,body);
+}
+/** The organisation-scoped actor when a super administrator has an act-for session open, otherwise null. */
+async function actingActor(req: NextRequest): Promise<Actor | null> {
+  if (!req.cookies.get(ACT_FOR_COOKIE)) return null;
+  const admin = await actorForToken(requestToken(req));
+  return admin ? delegatedActor(req, admin) : null;
+}
+/** Starts (POST portal/act-for) or ends (POST portal/act-for/stop) acting on behalf of an organisation. */
+async function actFor(req: NextRequest, path: string[], body: Record<string, unknown>): Promise<NextResponse> {
+  requireMethod(req, 'POST');
+  const admin = await authenticate(req);
+  if (path[2] === 'stop' && path.length === 3) {
+    const res = NextResponse.json({ stopped: true });
+    const acting = await delegatedActor(req, admin).catch(() => null);
+    if (acting?.delegation) await rows('INSERT INTO organisation_admin_events(org_ref,actor_id,operation,reason,details) VALUES($1,$2,$3,$4,$5)', [acting.delegation.target, admin.id, 'act_for.stopped', acting.delegation.reason, JSON.stringify({ label: 'Stopped working on behalf of the organisation' })]);
+    return setActForCookie(res, null);
+  }
+  if (path[2] === 'new-organisation' && path.length === 3) {
+    const started = await transaction(db => registerOrganisation(admin, body, db));
+    const setup = await sendAccountSetup(String(started.target.account.id));
+    await emailRecipients(started.notice.recipients, started.notice.subject, started.notice.body);
+    return setActForCookie(NextResponse.json({ target: started.ref, name: started.target.name, role: started.actor.role, home: started.target.home, setup }, { status: 201 }), started.cookie);
+  }
+  if (path.length !== 2) throw new ApiError(404, 'Not found');
+  const started = await transaction(db => startActing(admin, body, db));
+  await emailRecipients(started.notice.recipients, started.notice.subject, started.notice.body);
+  return setActForCookie(NextResponse.json({ target: started.ref, name: started.target.name, role: started.actor.role, home: started.target.home }, { status: 201 }), started.cookie);
+}
+function requireMethod(req: NextRequest, method: string) { if (req.method !== method) throw new ApiError(405, 'Method not allowed'); }
+/**
+ * Runs a request as the organisation, under its own scope and lifecycle rules. Changes commit together with
+ * the administration log entry and the organisation's notifications; read-only requests are not notified.
+ */
+async function onBehalf(req: NextRequest, actor: Actor, path: string[], body: Record<string, unknown>): Promise<NextResponse> {
+  const key = path.slice(0, 2).join('/');
+  if (key === 'portal/notifications' && req.method === 'POST') return NextResponse.json({ ok: true, unchanged: true });
+  if (key === 'portal/profile' || path[0] === 'portal-auth' && path[1] !== 'onboarding')
+    throw new ApiError(403, 'Personal account settings belong to the organisation’s users and cannot be changed on their behalf');
+  const write = !['GET', 'HEAD'].includes(req.method);
+  const run = async (): Promise<{ res: NextResponse; status: number; data?: unknown }> => {
+    if (path[0] === 'portal-auth') {
+      const res = await portalAuth(req, path[1], body, actor);
+      return { res, status: res.status, data: res.status < 300 ? await res.clone().json().catch(() => undefined) : undefined };
+    }
+    await gate(actor, req.method, path);
+    const result = await route(actor, req, path, body);
+    const status = result.status ?? 200;
+    return { res: status === 204 ? new NextResponse(null, { status: 204 }) : NextResponse.json(result.data, { status }), status, data: result.data };
+  };
+  if (!write) return (await run()).res;
+  const outcome = await transaction(async db => {
+    const done = await run();
+    const notice = done.status < 400 ? await recordDelegatedAction(actor, req.method, path, { status: done.status, data: done.data }, db) : null;
+    return { ...done, notice };
+  });
+  if (outcome.notice) await emailRecipients(outcome.notice.recipients, outcome.notice.subject, outcome.notice.body);
+  return outcome.res;
+}
+
 export function handleRequest(req: NextRequest, path: string[]): Promise<NextResponse> {
   return withRequest(req, () => dispatch(req, path));
 }
@@ -84,7 +151,15 @@ async function dispatch(req: NextRequest, path: string[]): Promise<NextResponse>
       }
     }
     let res: NextResponse;
-    if(path[0]==='portal-auth'&&path.length===2)res=await portalAuth(req,path[1],body);
+    const acting = await actingActor(req);
+    if (path[0]==='portal' && path[1]==='act-for') res = await actFor(req, path, body);
+    else if (acting && path[0]==='auth') {
+      // Account and credential actions stay with the administrator's own account; the act-for session ends on sign-out.
+      if (path[1]==='me' && req.method==='GET') res = NextResponse.json({ user: { id: acting.id, email: acting.email, role: acting.role, buyer_id: acting.buyer_id } });
+      else { res = await authRequest(req,path[1],body); if (path[1]==='logout') setActForCookie(res, null); }
+    }
+    else if (acting) res = await onBehalf(req, acting, path, body);
+    else if(path[0]==='portal-auth'&&path.length===2)res=await portalAuth(req,path[1],body);
     else if (path[0] === 'auth' && path.length === 2) res = await authRequest(req,path[1],body);
     else if (path.length === 1 && path[0] === 'health' && req.method === 'GET') {
       await rows('SELECT 1');
@@ -92,12 +167,7 @@ async function dispatch(req: NextRequest, path: string[]): Promise<NextResponse>
     } else {
       const actor = await authenticate(req);
       await gate(actor, req.method, path);
-      if(req.headers.has('idempotency-key'))body.idempotency_key=req.headers.get('idempotency-key');
-      const financial=['agreements','fundings','repayments'].includes(path[0])||path[0]==='invoices'&&['financials','agreements','fundings','repayments'].includes(path[2]);
-      const result: {status?:number;data?:unknown} = path[0]==='portal'?await portalRequest(actor,req.method,path,body):path[0]==='field-definitions'&&req.method==='GET'?await definitions(actor,path)
-        :path[0]==='lookups'&&path.length===2&&req.method==='GET'?await lookup(actor,path[1])
-        :path[0]==='controls'?await controlRecords(actor,req.method,path,body)
-        :financial?await financeRequest(actor,req.method,path,body):await resourceRequest(actor,req.method,path,body);
+      const result = await route(actor, req, path, body);
       res = result.status === 204 ? new NextResponse(null,{status:204}) : NextResponse.json(result.data,{status:result.status ?? 200});
     }
     return secureHeaders(res);

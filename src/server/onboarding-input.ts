@@ -1,0 +1,3 @@
+import {z} from 'zod';
+import {email} from './validation';
+export const onboardingSchema=z.object({type:z.enum(['BUYER','SUPPLIER','FINANCIER']),company:z.object({name:z.string().min(2).max(200),registrationNumber:z.string().min(1).max(100),country:z.string().min(2).max(100),address:z.string().min(3).max(500),email,phone:z.string().max(100),industry:z.string().max(200)}),representative:z.object({fullName:z.string().min(2),jobTitle:z.string().min(2),email,phone:z.string().min(5),authorised:z.literal(true)}),document_ids:z.array(z.string().regex(/^\d+$/)).min(1).max(20),confirmed:z.literal(true)});

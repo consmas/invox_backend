@@ -8,7 +8,7 @@ export const runtime='nodejs';
 const missing=()=>secureHeaders(new NextResponse(null,{status:404}));
 export async function GET(req:NextRequest,{params}:{params:Promise<{id:string}>}){
  try{const actor=await authenticate(req);if(privilegedMfaRequired(actor))return missing();const {id}=await params;if(!/^\d+$/.test(id))return missing();const [doc]=await rows('SELECT * FROM documents WHERE id=$1',[id]);if(!doc||doc.archived_at)return missing();
- let allowed=actor.role==='platform_ops'||String(doc.uploaded_by)===actor.id||actor.role==='buyer_admin'&&!!actor.buyer_id&&String(doc.buyer_id)===actor.buyer_id;
+ let allowed=actor.role==='platform_ops'||String(doc.uploaded_by)===actor.id||String(doc.on_behalf_of_user_id)===actor.id||actor.role==='buyer_admin'&&!!actor.buyer_id&&String(doc.buyer_id)===actor.buyer_id;
  if(!allowed&&doc.invoice_id){try{await resourceRequest(actor,'GET',['invoices',String(doc.invoice_id)]);allowed=true;}catch{}}
  if(!allowed){const invoices=await rows("SELECT id FROM invoices WHERE supporting_documents @> $1::jsonb",[JSON.stringify([{document_id:String(doc.id)}])]);for(const invoice of invoices){try{await resourceRequest(actor,'GET',['invoices',String(invoice.id)]);allowed=true;break;}catch{}}}
  if(!allowed)return missing();

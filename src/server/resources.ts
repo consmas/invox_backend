@@ -13,7 +13,7 @@ import { coreSchema,fieldSchema,fieldCatalog,rejectManagedFields,databaseValues,
 
 export type Result = { data?: unknown; status?: number };
 type Input = Record<string, unknown>;
-const userProfileColumns=['name','contact_phone','country','preferred_language','timezone','recert_cycle','mfa_enrolled_at','mfa_verified_at','last_successful_login_at','dormancy_suspended_at','last_recertified_at'];
+const userProfileColumns=['name','job_title','contact_phone','country','preferred_language','timezone','recert_cycle','mfa_enrolled_at','mfa_verified_at','last_successful_login_at','dormancy_suspended_at','last_recertified_at'];
 const userColumns = ['id','email','role','buyer_id','created_at','updated_at',...userProfileColumns].join(',');
 const supplierColumns = ['id','email','email AS contact_email','user_id','invited_at','created_at','updated_at',...fieldCatalog.suppliers.fields.filter(field=>!field.transient&&field.key!=='contact_email').map(field=>`"${field.key}"`)].join(',');
 // Counterparties never receive tax, address, screening or risk assessment fields (F03).
@@ -129,7 +129,7 @@ async function saveUser(data: Input, actor: Actor, db: DB, userId?: string, buye
   if (previous?.role === 2 && role !== 'platform_ops') await requireOtherOperator(String(previous.id), db);
   const attrs: Input = { role: roles.indexOf(role), buyer_id: targetBuyer };
   if (parsed.email !== undefined) attrs.email = parsed.email;
-  for(const key of ['name','contact_phone','country','preferred_language','timezone','recert_cycle'] as const)if(parsed[key]!==undefined)attrs[key]=parsed[key];
+  for(const key of ['name','job_title','contact_phone','country','preferred_language','timezone','recert_cycle'] as const)if(parsed[key]!==undefined)attrs[key]=parsed[key];
   if (parsed.password) attrs.encrypted_password = await hashPassword(parsed.password);
   if (!previous) {
     requireCondition(parsed.password, 422, 'Password is required');
@@ -425,6 +425,7 @@ export function priceBid(data:Row,invoice:Row):Row{
   const days=Math.max(0,Math.ceil((Date.parse(invoice.due_date+'T00:00:00Z')-Date.parse(today+'T00:00:00Z'))/86400000));
   const quote=discountQuote({amount:String(data.amount),model:data.discount_type,rate:data.discount_rate??'0',days,basis:String(data.day_count_basis)==='360'?360:365,fixed_fee:data.discount_fee??'0',other_fees:data.other_fees??'0'});
   requireCondition(!data.expires_at||Date.parse(data.expires_at)>Date.now(),422,'Bid expiry must be in the future');
+  requireCondition(!data.proposed_disbursement_date||String(data.proposed_disbursement_date)>=today&&String(data.proposed_disbursement_date)<=invoice.due_date,422,'Proposed disbursement date must be between today and the invoice due date');
   return {...data,requested_financing_amount:invoice.financing_amount_requested??invoice.amount,discount_fee:quote.discount_amount,net_supplier_proceeds:quote.net_supplier_proceeds,submitted_at:data.submitted_at??new Date().toISOString(),pricing_snapshot:{...quote,currency:data.currency,model:data.discount_type,rate:data.discount_rate??'0',days,day_count_basis:data.day_count_basis,calculated_at:new Date().toISOString()}};
 }
 async function financierJson(user:Row,db:DB){

@@ -24,3 +24,11 @@ export async function sendLink(email: string, subject: string, url: string): Pro
   });
   return {};
 }
+/** Informational notice email. Without SMTP configured it is skipped: the in-app notification is the record. */
+export async function sendNotice(email: string, subject: string, text: string): Promise<void> {
+  if (!process.env.SMTP_URL) return;
+  await nodemailer.createTransport(process.env.SMTP_URL).sendMail({
+    from: process.env.MAIL_FROM || 'Invoix <no-reply@localhost>', to: email, subject,
+    text: `${text}\n\nSign in to INVOX to review the change. If you did not expect this, contact INVOX operations.`,
+  });
+}

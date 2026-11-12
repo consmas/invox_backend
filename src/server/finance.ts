@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { type Actor,requireRole,digest } from './auth';
+import { preparedOnBehalfBy } from './act-for';
 import { rows,transaction,type DB,type Row } from './db';
 import { requireCondition,ApiError } from './errors';
 import { id,date } from './validation';
@@ -100,7 +101,7 @@ async function decideFunding(actor:Actor,invoice:Row,recordId:string,action:stri
   const [funding]=await rows('SELECT * FROM fundings WHERE id=$1 AND invoice_id=$2 FOR UPDATE',[recordId,invoice.id],db);
   requireCondition(funding,404,'Funding record not found');
   requireCondition(funding.status==='pending',409,'Funding evidence has already been decided');
-  requireCondition(!same(actor.id,funding.recorded_by),403,'The recorder cannot verify or reject their own payment evidence');
+  requireCondition(!same(actor.id,funding.recorded_by)&&!await preparedOnBehalfBy(actor.id,'funding',recordId,db),403,'The recorder cannot verify or reject their own payment evidence');
   const [agreement]=await rows('SELECT * FROM financing_agreements WHERE id=$1',[funding.agreement_id],db);
   if(action==='confirm') {
     requireCondition(invoice.status==='tender'&&agreement.status==='signed',409,'Funding prerequisites no longer hold');
@@ -142,7 +143,7 @@ async function decideReceipt(actor:Actor,invoice:Row,recordId:string,action:stri
   const [receipt]=await rows('SELECT * FROM repayments WHERE id=$1 AND invoice_id=$2 FOR UPDATE',[recordId,invoice.id],db);
   requireCondition(receipt,404,'Repayment record not found');
   requireCondition(receipt.status==='pending',409,'Repayment evidence has already been decided');
-  requireCondition(!same(actor.id,receipt.recorded_by),403,'The recorder cannot verify or reject their own receipt');
+  requireCondition(!same(actor.id,receipt.recorded_by)&&!await preparedOnBehalfBy(actor.id,'repayment',recordId,db),403,'The recorder cannot verify or reject their own receipt');
   if(action==='confirm') {
     const [position]=await rows('SELECT * FROM financial_positions WHERE funding_id=$1',[receipt.funding_id],db);
     requireCondition(position,409,'Verified funding is required');

@@ -8,6 +8,7 @@ import { fieldCatalog, fieldSchema, coreSchema, databaseValues, rejectManagedFie
 import { resourceRequest, invoiceList, lockOperatorSet } from './resources';
 import { assertFresh } from './context';
 import { portalEvent, notify } from './portal-support';
+import { preparedOnBehalfBy } from './act-for';
 import { cents } from './money';
 type Module = {
     key: string;
@@ -117,7 +118,7 @@ async function actionsFor(entity: string, record: Row, actor: Actor, db: DB) {
     if (entity === 'documents') {
         const references = Object.values(fieldCatalog).flatMap(definition => definition.fields.filter(field => field.reference === 'documents' && field.type === 'reference').map(field => `SELECT id FROM ${tableFor(definition.key)} WHERE "${field.key}"=$2`));
         const linked = (await rows(`SELECT id FROM invoices WHERE supporting_documents @> $1::jsonb UNION ALL ${references.join(' UNION ALL ')} LIMIT 1`, [JSON.stringify([{ document_id: String(record.id) }]), record.id], db)).length > 0;
-        const owned = actor.role === 'platform_ops' || same(record.uploaded_by, actor.id);
+        const owned = actor.role === 'platform_ops' || same(record.uploaded_by, actor.id) || same(record.on_behalf_of_user_id, actor.id);
         return { edit: owned && !record.archived_at, delete: owned && !linked && !record.legal_hold && (!record.retention_until || record.retention_until < new Date().toISOString().slice(0, 10)), reason: linked ? 'This evidence is referenced by a transaction and cannot be removed.' : record.legal_hold ? 'A legal hold prevents deletion.' : null };
     }
     if (['buyers', 'suppliers', 'financers'].includes(entity))
@@ -196,7 +197,7 @@ async function listRecords(entity: string, actor: Actor, db: DB, recordId?: stri
         else if (entity === 'tenders')
             records = await rows('SELECT * FROM financing_tenders WHERE invoice_id=ANY($1::bigint[]) ORDER BY id DESC', [invoiceIds], db);
         else if (entity === 'documents')
-            records = await rows(`SELECT id,file_name,category,mime_type,size_bytes,sha256,invoice_id,buyer_id,supplier_id,legal_hold,retention_until,scan_status,upload_status,uploaded_by,archived_at,created_at,updated_at FROM documents WHERE $1 OR uploaded_by=$2 OR buyer_id=$3 OR invoice_id=ANY($4::bigint[]) OR EXISTS(SELECT 1 FROM invoices i,jsonb_array_elements(coalesce(i.supporting_documents,'[]'::jsonb)) d WHERE i.id=ANY($4::bigint[]) AND d->>'document_id'=documents.id::text) ORDER BY id DESC LIMIT 250`, [actor.role === 'platform_ops', actor.id, actor.role === 'buyer_admin' ? actor.buyer_id : null, invoiceIds], db);
+            records = await rows(`SELECT id,file_name,category,mime_type,size_bytes,sha256,invoice_id,buyer_id,supplier_id,legal_hold,retention_until,scan_status,upload_status,uploaded_by,on_behalf_of_user_id,archived_at,created_at,updated_at FROM documents WHERE $1 OR uploaded_by=$2 OR on_behalf_of_user_id=$2 OR buyer_id=$3 OR invoice_id=ANY($4::bigint[]) OR EXISTS(SELECT 1 FROM invoices i,jsonb_array_elements(coalesce(i.supporting_documents,'[]'::jsonb)) d WHERE i.id=ANY($4::bigint[]) AND d->>'document_id'=documents.id::text) ORDER BY id DESC LIMIT 250`, [actor.role === 'platform_ops', actor.id, actor.role === 'buyer_admin' ? actor.buyer_id : null, invoiceIds], db);
         else if (entity === 'financing_requests')
             records = await rows('SELECT * FROM financing_requests WHERE $1 OR invoice_id=ANY($2::bigint[]) ORDER BY id DESC', [actor.role === 'platform_ops', invoiceIds], db);
         else if (entity === 'mandate_versions')
@@ -497,6 +498,9 @@ async function editTender(actor: Actor, previous: Row, input: Row, db: DB) {
 async function transition(entity: string, recordId: string, action: string, input: Row, previous: Row, actor: Actor, db: DB) {
     const allowed = await actionsFor(entity, previous, actor, db);
     requireCondition((allowed as Row)[action] === true, 409, (allowed as Row).reason ?? 'This action is unavailable in the current state');
+    // Checker steps: an administrator cannot approve what they prepared while acting for the organisation.
+    if (actor.role === 'platform_ops' && ['approve', 'activate', 'review', 'decline'].includes(action))
+        requireCondition(!await preparedOnBehalfBy(actor.id, entity, recordId, db), 403, 'You prepared this record on behalf of the organisation; a different operator must approve it');
     const reason = reasonSchema.parse(input.reason);
     let result: Row;
     if (entity === 'programmes') {

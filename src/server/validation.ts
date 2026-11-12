@@ -18,7 +18,7 @@ export const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/).refine(value => {
 export const userInput = z.object({
   email, password: password.optional(), password_confirmation: z.string().optional(),
   role: z.enum(roles).default('supplier_user'), buyer_id: id.nullable().optional(),
-  name:z.string().trim().max(200).nullable().optional(),contact_phone:z.string().trim().max(100).nullable().optional(),country:z.string().toUpperCase().regex(/^[A-Z]{2}$/).nullable().optional(),preferred_language:z.string().trim().max(50).nullable().optional(),timezone:z.string().trim().max(100).nullable().optional(),recert_cycle:z.coerce.number().int().min(1).max(120).optional(),
+  name:z.string().trim().max(200).nullable().optional(),job_title:z.string().trim().max(200).nullable().optional(),contact_phone:z.string().trim().max(100).nullable().optional(),country:z.string().toUpperCase().regex(/^[A-Z]{2}$/).nullable().optional(),preferred_language:z.string().trim().max(50).nullable().optional(),timezone:z.string().trim().max(100).nullable().optional(),recert_cycle:z.coerce.number().int().min(1).max(120).optional(),
 });
 export const buyerInput = z.object({ name: z.string().trim().min(1).max(200), registration_number: z.string().trim().min(1).max(100),
   address: z.string().max(1000).default(''), contact_email: email });

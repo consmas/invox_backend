@@ -11,22 +11,27 @@ import {cents} from './money';
 import {digest,newToken} from './auth';
 import {sendLink,appUrl} from './mail';
 import {orgRef,portalEvent,notify,sessionData} from './portal-support';
+import {preparedOnBehalfBy} from './act-for';
 export {orgRef,portalEvent,sessionData} from './portal-support';
 const same=(a:unknown,b:unknown)=>String(a)===String(b);
 // Field policy (F09): counterparties receive only the identity and terms needed to act; private legal, fee,
 // control and contact configuration stays with the owning organisation and operations.
-const programmePublic='p.id,p.name,p.buyer_id,p.currency,p.status,p.programme_reference,p.maximum_tenor_days,p.maturity_days,p.day_count_basis,p.archived_at,p.created_at';
+// Public opportunity terms only: no limits, fee rates, margins, agreement documents or internal release identities.
+const programmePublic='p.id,p.name,p.buyer_id,p.currency,p.status,p.programme_reference,p.description,p.payment_terms,p.maximum_tenor_days,p.maturity_days,p.discount_type,p.day_count_basis,p.governing_law,p.jurisdiction,p.financing_eligibility_criteria,p.risk_disclosures,p.effective_from,p.effective_to,p.archived_at,p.created_at';
 const buyerPublic='b.id,b.name,b.legal_name,b.trading_name,b.country,b.created_at';
 const supplierPublic='s.id,s.name,s.legal_name,s.country,s.created_at';
-const supplierOwned='s.id,s.name,s.email,s.user_id,s.legal_name,s.registration_number,s.country,s.registered_address,s.industry,s.contact_name,s.contact_phone,s.verification_status,s.created_at';
+// The supplier itself and operations see the full legal profile; buyers see a partner view without tax,
+// address, screening or risk fields. Relationship contacts are returned separately, never merged in.
+const supplierOwned='s.id,s.name,s.email,s.user_id,s.legal_name,s.trading_name,s.registration_number,s.country,s.industry,s.registered_address,s.operating_address,s.contact_name,s.contact_title,s.contact_phone,s.website,s.tax_id,s.vat_number,s.vat_registered,s.withholding_tax_rate,s.preferred_currency,s.preferred_language,s.verification_status,s.approval_status,s.onboarding_status,s.next_review_date,s.created_at';
+const supplierPartner='s.id,s.name,s.email,s.user_id,s.legal_name,s.trading_name,s.registration_number,s.country,s.industry,s.contact_name,s.contact_title,s.contact_phone,s.website,s.preferred_currency,s.preferred_language,s.verification_status,s.created_at';
 async function bootstrap(actor:Actor){
  const session=await sessionData(actor);
  const notifications=await rows('SELECT id,subject,body,created_at,read_at,related_id FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT 250',[actor.id]);
  // Unverified or membership-less accounts see only their own onboarding material.
  if(actor.role!=='platform_ops'&&(session.needs_onboarding||actor.role==='buyer_admin'&&!actor.buyer_id)){
-  const documents=await rows('SELECT id,buyer_id,supplier_id,invoice_id,file_name,category,size_bytes,created_at,uploaded_by,review_status,review_reason FROM documents WHERE archived_at IS NULL AND uploaded_by=$1',[actor.id]);
+  const documents=await rows('SELECT id,buyer_id,supplier_id,invoice_id,file_name,category,size_bytes,created_at,uploaded_by,review_status,review_reason FROM documents WHERE archived_at IS NULL AND (uploaded_by=$1 OR on_behalf_of_user_id=$1)',[actor.id]);
   const reviews=session.org_ref?await rows('SELECT org_ref,status,note,submitted_at,reviewed_at FROM portal_org_reviews WHERE org_ref=$1',[session.org_ref]):[];
-  return {session,invoices:[],programmes:[],buyers:[],suppliers:[],financiers:[],bids:[],tenders:[],tenderInvitations:[],fundings:[],positions:[],agreements:[],events:[],reviews,documents,notifications,exceptions:[],membership:[],mandates:[]};
+  return {session,invoices:[],programmes:[],buyers:[],suppliers:[],financiers:[],bids:[],tenders:[],tenderInvitations:[],fundings:[],positions:[],agreements:[],events:[],reviews,documents,notifications,exceptions:[],membership:[],mandates:[],adminActions:await adminLog(actor,session.org_ref),registrations:[]};
  }
  const ops=actor.role==='platform_ops';const buyer=actor.role==='buyer_admin';
  const invoices=(await resourceRequest(actor,'GET',['invoices'])).data as Row[];
@@ -36,31 +41,41 @@ async function bootstrap(actor:Actor){
   ...(buyer?await rows('SELECT b.*,(SELECT count(*)::int FROM users u WHERE u.buyer_id=b.id) AS user_count FROM buyers b WHERE b.id=$1',[actor.buyer_id]):[]),
   ...await rows(`SELECT ${buyerPublic} FROM buyers b WHERE b.id=ANY($1::bigint[]) AND b.id IS DISTINCT FROM $2::bigint`,[invoices.map(i=>i.buyer_id),actor.buyer_id])];
  const suppliers=ops?await rows(`SELECT ${supplierOwned} FROM suppliers s`)
-  :buyer?await rows(`SELECT ${supplierOwned} FROM suppliers s WHERE s.id=ANY($1::bigint[]) OR EXISTS(SELECT 1 FROM portal_supplier_relationships r WHERE r.supplier_id=s.id AND r.buyer_id=$2 AND r.status='active')`,[invoices.map(i=>i.supplier_id),actor.buyer_id])
+  :buyer?await rows(`SELECT ${supplierPartner} FROM suppliers s WHERE s.id=ANY($1::bigint[]) OR EXISTS(SELECT 1 FROM portal_supplier_relationships r WHERE r.supplier_id=s.id AND r.buyer_id=$2 AND r.status='active')`,[invoices.map(i=>i.supplier_id),actor.buyer_id])
   :actor.role==='supplier_user'?await rows(`SELECT ${supplierOwned} FROM suppliers s WHERE s.user_id=$1`,[actor.id])
   :await rows(`SELECT ${supplierPublic} FROM suppliers s WHERE s.id=ANY($1::bigint[])`,[invoices.map(i=>i.supplier_id)]);
- if(buyer){const relationships=await rows('SELECT * FROM portal_supplier_relationships WHERE buyer_id=$1',[actor.buyer_id]);for(const supplier of suppliers){const relationship=relationships.find(r=>same(r.supplier_id,supplier.id));if(relationship)Object.assign(supplier,{contact_name:relationship.contact_name??supplier.contact_name,contact_phone:relationship.contact_phone??supplier.contact_phone,contact_email:relationship.contact_email??supplier.email});}}
+ if(buyer){const relationships=await rows('SELECT * FROM portal_supplier_relationships WHERE buyer_id=$1',[actor.buyer_id]);for(const supplier of suppliers){const relationship=relationships.find(r=>same(r.supplier_id,supplier.id));if(relationship)supplier.relationship={id:relationship.id,contact_name:relationship.contact_name,contact_email:relationship.contact_email,contact_phone:relationship.contact_phone,payment_terms:relationship.payment_terms,notes:relationship.notes,status:relationship.status};}}
  const bids=await rows(`SELECT d.* FROM bids d WHERE invoice_id=ANY($1::bigint[]) ${actor.role==='financer'?'AND financer_id=$2':''} ${actor.role!=='financer'?"AND portal_state IS DISTINCT FROM 'DRAFT'":''}`,[ids,...(actor.role==='financer'?[actor.id]:[])]);
- const financiers=ops?await rows('SELECT f.*,u.email FROM financier_profiles f JOIN users u ON u.id=f.user_id')
-  :await rows(`SELECT f.user_id,f.name,f.country,CASE WHEN f.user_id=$1 THEN f.contact_email END AS email,f.created_at FROM financier_profiles f JOIN users u ON u.id=f.user_id WHERE f.user_id=$1 OR f.user_id=ANY($2::bigint[]) OR ($3 AND u.disabled_at IS NULL AND f.archived_at IS NULL)`,[actor.id,bids.map(b=>b.financer_id),buyer&&!!actor.buyer_id]);
+ const financiers=ops?await rows('SELECT f.*,u.email FROM financier_profiles f JOIN users u ON u.id=f.user_id'):[
+  // A financier sees its own complete profile; others see the institution's public identity only.
+  ...(actor.role==='financer'?await rows('SELECT f.*,u.email FROM financier_profiles f JOIN users u ON u.id=f.user_id WHERE f.user_id=$1',[actor.id]):[]),
+  ...await rows(`SELECT f.user_id,f.name,f.legal_name,f.trading_name,f.institution_type,f.country,f.website,f.created_at FROM financier_profiles f JOIN users u ON u.id=f.user_id WHERE f.user_id<>$1 AND (f.user_id=ANY($2::bigint[]) OR ($3 AND u.disabled_at IS NULL AND f.archived_at IS NULL))`,[actor.id,bids.map(b=>b.financer_id),buyer&&!!actor.buyer_id])];
  const tenders=await rows('SELECT * FROM financing_tenders WHERE invoice_id=ANY($1::bigint[]) ORDER BY id',[ids]);
  const tenderInvitations=await rows('SELECT * FROM portal_tender_invitations WHERE tender_id=ANY($1::bigint[]) AND ($2::bigint IS NULL OR financer_id=$2)',[tenders.map(t=>t.id),actor.role==='financer'?actor.id:null]);
- const fundings=await rows(`SELECT f.*,a.bid_id,a.net_disbursement,a.repayment_amount,a.maturity_date FROM fundings f JOIN financing_agreements a ON a.id=f.agreement_id WHERE f.invoice_id=ANY($1::bigint[]) ${actor.role==='financer'?'AND a.bid_id=ANY($2::bigint[])':''}`,[ids,...(actor.role==='financer'?[bids.map(b=>b.id)]:[])]);
+ const fundings=await rows(`SELECT f.*,a.bid_id,a.net_disbursement,a.repayment_amount,a.maturity_date,a.agreement_reference,ru.name AS recorded_by_name,cu.name AS confirmed_by_name FROM fundings f JOIN financing_agreements a ON a.id=f.agreement_id LEFT JOIN users ru ON ru.id=f.recorded_by LEFT JOIN users cu ON cu.id=f.confirmed_by WHERE f.invoice_id=ANY($1::bigint[]) ${actor.role==='financer'?'AND a.bid_id=ANY($2::bigint[])':''}`,[ids,...(actor.role==='financer'?[bids.map(b=>b.id)]:[])]);
  const positions=await rows('SELECT * FROM financial_positions WHERE invoice_id=ANY($1::bigint[])',[fundings.map(f=>f.invoice_id)]);
  const agreements=await rows('SELECT * FROM financing_agreements WHERE invoice_id=ANY($1::bigint[])',[fundings.map(f=>f.invoice_id)]);
  // Audit details and actor e-mail addresses stay with operations; counterparties see what happened and when.
- const events=await rows(`SELECT e.id,e.invoice_id,e.event,e.reason,e.created_at,u.name AS actor_name,CASE WHEN $4 OR e.actor_id=$5 THEN u.email END AS actor_email,u.role AS actor_role,e.org_ref,CASE WHEN $4 THEN e.details ELSE '{}'::jsonb END AS details FROM portal_events e LEFT JOIN users u ON u.id=e.actor_id WHERE ($1 OR e.invoice_id=ANY($2::bigint[])) ${actor.role==='financer'?"AND (e.actor_id=$3 OR e.event NOT LIKE 'bid.%')":'AND $3::bigint IS NOT NULL'} ORDER BY e.id DESC LIMIT 1000`,[ops,ids,actor.id,ops,actor.id]);
- const financialEvents=await rows(`SELECT 'finance-'||e.id::text AS id,e.invoice_id,e.event,NULL::text AS reason,e.created_at,u.name AS actor_name,CASE WHEN $2 OR e.actor_id=$3 THEN u.email END AS actor_email,u.role AS actor_role,NULL::varchar AS org_ref,CASE WHEN $2 THEN e.details ELSE '{}'::jsonb END AS details FROM audit_events e LEFT JOIN users u ON u.id=e.actor_id WHERE e.invoice_id=ANY($1::bigint[]) ORDER BY e.id DESC LIMIT 1000`,[actor.role==='financer'?invoices.filter(i=>bids.some(b=>same(b.invoice_id,i.id)&&b.status===1)).map(i=>i.id):ids,ops,actor.id]);
+ const events=await rows(`SELECT e.id,e.invoice_id,e.event,e.reason,e.created_at,u.name AS actor_name,CASE WHEN $4 OR e.actor_id=$5 THEN u.email END AS actor_email,u.role AS actor_role,e.org_ref,CASE WHEN $4 THEN e.details ELSE '{}'::jsonb END AS details,au.name AS acting_admin_name,(e.acting_admin_id IS NOT NULL) AS on_behalf FROM portal_events e LEFT JOIN users u ON u.id=e.actor_id LEFT JOIN users au ON au.id=e.acting_admin_id WHERE ($1 OR e.invoice_id=ANY($2::bigint[])) ${actor.role==='financer'?"AND (e.actor_id=$3 OR e.event NOT LIKE 'bid.%')":'AND $3::bigint IS NOT NULL'} ORDER BY e.id DESC LIMIT 1000`,[ops,ids,actor.id,ops,actor.id]);
+ const financialEvents=await rows(`SELECT 'finance-'||e.id::text AS id,e.invoice_id,e.event,NULL::text AS reason,e.created_at,u.name AS actor_name,CASE WHEN $2 OR e.actor_id=$3 THEN u.email END AS actor_email,u.role AS actor_role,NULL::varchar AS org_ref,CASE WHEN $2 THEN e.details ELSE '{}'::jsonb END AS details,au.name AS acting_admin_name,(e.acting_admin_id IS NOT NULL) AS on_behalf FROM audit_events e LEFT JOIN users u ON u.id=e.actor_id LEFT JOIN users au ON au.id=e.acting_admin_id WHERE e.invoice_id=ANY($1::bigint[]) ORDER BY e.id DESC LIMIT 1000`,[actor.role==='financer'?invoices.filter(i=>bids.some(b=>same(b.invoice_id,i.id)&&b.status===1)).map(i=>i.id):ids,ops,actor.id]);
  events.push(...financialEvents);events.sort((a,b)=>new Date(b.created_at).getTime()-new Date(a.created_at).getTime());
  const reviews=await rows('SELECT org_ref,status,CASE WHEN $1 OR org_ref=$3 THEN note ELSE NULL END AS note,submitted_at,reviewed_at FROM portal_org_reviews WHERE $1 OR org_ref=ANY($2::varchar[])',[ops,[...buyers.map(b=>`buyer-${b.id}`),...suppliers.map(s=>`supplier-${s.id}`),...financiers.map(f=>`financier-${f.user_id}`)],session.org_ref]);
- const documents=await rows(`SELECT id,buyer_id,supplier_id,invoice_id,file_name,category,size_bytes,created_at,uploaded_by,review_status,review_reason FROM documents WHERE archived_at IS NULL AND ($1 OR invoice_id=ANY($2::bigint[]) OR uploaded_by=$3 OR buyer_id=$4 OR EXISTS(SELECT 1 FROM invoices i,jsonb_array_elements(coalesce(i.supporting_documents,'[]'::jsonb)) d WHERE i.id=ANY($2::bigint[]) AND d->>'document_id'=documents.id::text))`,[ops,ids,actor.id,buyer?actor.buyer_id:null]);
+ const documents=await rows(`SELECT id,buyer_id,supplier_id,invoice_id,file_name,category,size_bytes,created_at,uploaded_by,review_status,review_reason FROM documents WHERE archived_at IS NULL AND ($1 OR invoice_id=ANY($2::bigint[]) OR uploaded_by=$3 OR on_behalf_of_user_id=$3 OR buyer_id=$4 OR EXISTS(SELECT 1 FROM invoices i,jsonb_array_elements(coalesce(i.supporting_documents,'[]'::jsonb)) d WHERE i.id=ANY($2::bigint[]) AND d->>'document_id'=documents.id::text))`,[ops,ids,actor.id,buyer?actor.buyer_id:null]);
  const exceptions=ops?await rows('SELECT * FROM portal_exceptions ORDER BY id DESC LIMIT 250'):[];
  // Programme membership is disclosed to the owner; counterparties see only their own participation.
  const membership=ops||buyer?await rows('SELECT * FROM portal_programme_suppliers WHERE programme_id=ANY($1::bigint[])',[programmes.map(p=>p.id)])
   :actor.role==='supplier_user'?await rows('SELECT ps.* FROM portal_programme_suppliers ps JOIN suppliers s ON s.id=ps.supplier_id WHERE ps.programme_id=ANY($1::bigint[]) AND s.user_id=$2',[programmes.map(p=>p.id),actor.id]):[];
  const mandates=ops||buyer?await rows('SELECT * FROM portal_programme_financiers WHERE programme_id=ANY($1::bigint[])',[programmes.map(p=>p.id)])
   :actor.role==='financer'?await rows('SELECT * FROM portal_programme_financiers WHERE programme_id=ANY($1::bigint[]) AND financer_id=$2',[programmes.map(p=>p.id),actor.id]):[];
- return {session,invoices,programmes,buyers,suppliers,financiers,bids,tenders,tenderInvitations,fundings,positions,agreements,events,reviews,documents,notifications,exceptions,membership,mandates};
+ const adminActions=await adminLog(actor,session.org_ref);
+ // Super administrators see registrations that have not created their organisation yet, to complete onboarding for them.
+ const registrations=session.super_admin?await rows("SELECT u.id,u.name,u.email,u.role,u.created_at,u.email_verified_at FROM users u LEFT JOIN suppliers s ON s.user_id=u.id LEFT JOIN financier_profiles f ON f.user_id=u.id WHERE u.portal_registration AND u.role<>2 AND u.disabled_at IS NULL AND u.buyer_id IS NULL AND s.id IS NULL AND f.user_id IS NULL ORDER BY u.id DESC LIMIT 250"):[];
+ return {session,invoices,programmes,buyers,suppliers,financiers,bids,tenders,tenderInvitations,fundings,positions,agreements,events,reviews,documents,notifications,exceptions,membership,mandates,adminActions,registrations};
+}
+/** Actions taken by administrators on an organisation's behalf. Operations see every entry; an organisation sees its own. */
+async function adminLog(actor:Actor,ref:string|null){
+ const ops=actor.role==='platform_ops'&&!actor.delegation;const refs=[ref,`user-${actor.id}`].filter(Boolean);
+ return rows("SELECT e.id,e.org_ref,e.operation,e.reason,e.created_at,e.details->>'label' AS label,u.name AS admin_name,CASE WHEN $1 THEN u.email END AS admin_email FROM organisation_admin_events e JOIN users u ON u.id=e.actor_id WHERE $1 OR e.org_ref=ANY($2::varchar[]) ORDER BY e.id DESC LIMIT 250",[ops,refs]);
 }
 async function ownedInvoice(actor:Actor,invoiceId:string,db:DB){
  const [invoice]=await rows('SELECT i.*,p.buyer_id,p.status AS programme_status,p.currency AS programme_currency,p.archived_at AS programme_archived_at,p.maximum_tenor_days,s.archived_at AS supplier_archived_at,s.user_id AS supplier_user_id FROM invoices i JOIN programmes p ON p.id=i.programme_id JOIN suppliers s ON s.id=i.supplier_id WHERE i.id=$1 FOR UPDATE OF i',[invoiceId],db);
@@ -88,7 +103,7 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
    await rows("UPDATE invoices SET status='draft',invoice_approval_status='pending',submitted_for_approval_at=now(),rejection_reason=NULL,clarification_request=NULL,updated_at=now() WHERE id=$1",[invoice.id],db);
    await notify(invoice.supplier_user_id,'Invoice awaiting approval',`Invoice ${invoice.invoice_number} needs your review.`,invoice.id,actor,db);
   }else{
-   requireRole(actor,'supplier_user');requireCondition(invoice.invoice_approval_status==='pending',409,'Invoice is not awaiting your decision');
+   requireRole(actor,'supplier_user','platform_ops');if(actor.role==='platform_ops')requireCondition(typeof body.reason==='string'&&body.reason.trim().length>=10,422,'A reason is required for an administrator decision on behalf of the supplier');requireCondition(invoice.invoice_approval_status==='pending',409,'Invoice is not awaiting your decision');
    const input=z.object({decision:z.enum(['approve','reject','clarify']),reason:z.string().trim().min(5).max(2000).optional()}).parse(body);requireCondition(input.decision==='approve'||input.reason,422,'A reason is required');
    await rows("UPDATE invoices SET invoice_approval_status=$2::varchar,status=CASE WHEN $2::varchar='approved' THEN 'approved' ELSE 'draft' END,supplier_approved_at=CASE WHEN $2::varchar='approved' THEN now() ELSE NULL END,supplier_approved_by=CASE WHEN $2::varchar='approved' THEN $3::bigint ELSE NULL END,rejection_reason=CASE WHEN $2::varchar='rejected' THEN $4 ELSE NULL END,clarification_request=CASE WHEN $2::varchar='clarification' THEN $4 ELSE NULL END,updated_at=now() WHERE id=$1",[invoice.id,{approve:'approved',reject:'rejected',clarify:'clarification'}[input.decision],actor.id,input.reason??null],db);
    body.reason=input.reason;const owners=await rows('SELECT id FROM users WHERE buyer_id=$1',[invoice.buyer_id],db);for(const owner of owners)await notify(owner.id,{approve:'Invoice approved by supplier',reject:'Invoice rejected by supplier',clarify:'Supplier asked for clarification'}[input.decision],`${invoice.invoice_number}: ${{approve:'approved and ready to open for financing.',reject:'rejected',clarify:'clarification requested'}[input.decision]}${input.reason?` — ${input.reason}`:input.decision==='approve'?'':'.'}`,invoice.id,actor,db);
@@ -111,19 +126,21 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
   await portalEvent(actor,'tender.opened',null,invoice.id,{tender_id:tender.id},db);return {data:tender,status:201};
  });
  if(resource==='bids'&&method==='POST'&&!rawId)return transaction(async db=>{
-  requireRole(actor,'financer');const data=z.object({tender_id:id,submit:z.boolean(),disbursement_date:date.optional(),bid:z.record(z.string(),z.unknown())}).parse(body);
+  requireRole(actor,'financer','platform_ops');const data=z.object({financier_id:id.optional(),tender_id:id,submit:z.boolean(),disbursement_date:date.optional(),bid:z.record(z.string(),z.unknown())}).parse(body);
+  const financierId=actor.role==='platform_ops'?id.parse(data.financier_id):actor.id;requireCondition(actor.role==='platform_ops'||!data.financier_id||String(data.financier_id)===actor.id,403,'Cannot submit another financier’s offer');
+  requireCondition((await rows('SELECT u.id FROM users u JOIN financier_profiles f ON f.user_id=u.id WHERE u.id=$1 AND u.role=3 AND u.disabled_at IS NULL AND f.archived_at IS NULL',[financierId],db)).length,422,'Financier account is unavailable');
   const [target]=await rows('SELECT invoice_id FROM financing_tenders WHERE id=$1',[data.tender_id],db);requireCondition(target,404,'Tender not found');
-  requireCondition((await rows('SELECT 1 FROM portal_tender_invitations WHERE tender_id=$1 AND financer_id=$2',[data.tender_id,actor.id],db)).length,403,'You are not invited to this tender');
+  requireCondition((await rows('SELECT 1 FROM portal_tender_invitations WHERE tender_id=$1 AND financer_id=$2',[data.tender_id,financierId],db)).length,403,'You are not invited to this tender');
   const [invoice]=await rows('SELECT * FROM invoices WHERE id=$1 FOR UPDATE',[target.invoice_id],db);requireCondition(invoice&&!invoice.deleted_at&&!invoice.financial_review_required,409,'Invoice requires reconciliation');
   const [tender]=await rows('SELECT * FROM financing_tenders WHERE id=$1 FOR UPDATE',[data.tender_id],db);requireCondition(tender&&tender.status==='open'&&new Date(tender.closes_at).getTime()>Date.now(),409,'Tender is closed');
   requireCondition(!data.disbursement_date||(data.disbursement_date>=new Date().toISOString().slice(0,10)&&data.disbursement_date<=invoice.due_date),422,'Disbursement date must be between today and maturity');
-  const bidInput=coreSchema('bids').parse(data.bid);const priced=priceBid(bidInput,invoice);requireCondition(cents(String(priced.amount))<=cents(invoice.amount),422,'Offer exceeds invoice face value');const values={...databaseValues('bids',priced),invoice_id:invoice.id,financer_id:actor.id,status:0,portal_state:data.submit?'SUBMITTED':'DRAFT',proposed_disbursement_date:data.disbursement_date??null};
-  const [existing]=await rows('SELECT * FROM bids WHERE invoice_id=$1 AND financer_id=$2 AND status=0 FOR UPDATE',[invoice.id,actor.id],db);
+  const bidInput=coreSchema('bids').parse(data.bid);const priced=priceBid(bidInput,invoice);requireCondition(cents(String(priced.amount))<=cents(invoice.amount),422,'Offer exceeds invoice face value');const values={...databaseValues('bids',priced),invoice_id:invoice.id,financer_id:financierId,status:0,portal_state:data.submit?'SUBMITTED':'DRAFT',proposed_disbursement_date:data.disbursement_date??null};
+  const [existing]=await rows('SELECT * FROM bids WHERE invoice_id=$1 AND financer_id=$2 AND status=0 FOR UPDATE',[invoice.id,financierId],db);
   const keys=Object.keys(values);let bid;if(existing){const [updated]=await rows(`UPDATE bids SET ${keys.map((key,i)=>'"'+key+'"=$'+(i+2)).join(',')},updated_at=now() WHERE id=$1 RETURNING *`,[existing.id,...Object.values(values)],db);bid=updated;}else bid=await insert('bids',values,db);
   await portalEvent(actor,data.submit?'bid.submitted':'bid.draft_saved',null,invoice.id,{bid_id:bid.id},db);return {data:bid,status:201};
  });
  if(resource==='bids'&&rawId&&action==='withdraw'&&method==='POST'){
-  requireRole(actor,'financer');return transaction(async db=>{const [bid]=await rows("UPDATE bids SET status=2,portal_state='WITHDRAWN',updated_at=now() WHERE id=$1 AND financer_id=$2 AND status=0 RETURNING *",[id.parse(rawId),actor.id],db);requireCondition(bid,409,'This offer cannot be withdrawn');await portalEvent(actor,'bid.withdrawn',null,bid.invoice_id,{bid_id:bid.id},db);return {data:bid};});
+  requireRole(actor,'financer','platform_ops');return transaction(async db=>{const [bid]=await rows("UPDATE bids SET status=2,portal_state='WITHDRAWN',updated_at=now() WHERE id=$1 AND (financer_id=$2 OR $3) AND status=0 RETURNING *",[id.parse(rawId),actor.id,actor.role==='platform_ops'],db);requireCondition(bid,409,'This offer cannot be withdrawn');await portalEvent(actor,'bid.withdrawn',null,bid.invoice_id,{bid_id:bid.id},db);return {data:bid};});
  }
  if(resource==='programmes'&&method==='POST'){
   requireRole(actor,'buyer_admin','platform_ops');
@@ -155,12 +172,12 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
  }
  if(resource==='verification'&&rawId&&method==='POST'){
   requireRole(actor,'platform_ops');const data=z.object({status:z.enum(['APPROVED','REJECTED','INFO_REQUIRED']),note:z.string().trim().max(4000).optional()}).parse(body);requireCondition(data.status==='APPROVED'||data.note&&data.note.length>=5,422,'A reason is required');
-  return transaction(async db=>{const [review]=await rows('SELECT * FROM portal_org_reviews WHERE org_ref=$1 FOR UPDATE',[rawId],db);requireCondition(review,409,'This organisation has not submitted its onboarding evidence');requireCondition(!same(review.submitted_by,actor.id),403,'A different operator must review the submission');
+  return transaction(async db=>{const [review]=await rows('SELECT * FROM portal_org_reviews WHERE org_ref=$1 FOR UPDATE',[rawId],db);requireCondition(review,409,'This organisation has not submitted its onboarding evidence');requireCondition(!same(review.submitted_by,actor.id)&&!await preparedOnBehalfBy(actor.id,'onboarding',rawId,db),403,'A different operator must review the submission');
    if(data.status==='APPROVED'){
     // Approval releases the organisation only on the exact submitted evidence: unchanged, current, still owned and verified.
     const submitted=(review.payload?.document_evidence??(review.payload?.document_ids??[]).map((key:string)=>({id:key}))) as {id:string;sha256?:string}[];
     requireCondition(submitted.length>0,409,'Document evidence is required before approval');
-    const docs=await rows("SELECT id,sha256,review_status,archived_at FROM documents WHERE id=ANY($1::bigint[]) AND uploaded_by=$2 AND upload_status='stored'",[submitted.map(d=>d.id),review.submitted_by],db);
+    const docs=await rows("SELECT id,sha256,review_status,archived_at FROM documents WHERE id=ANY($1::bigint[]) AND (uploaded_by=$2 OR on_behalf_of_user_id=$2 OR org_ref=$3) AND upload_status='stored'",[submitted.map(d=>d.id),review.submitted_by,rawId],db);
     for(const item of submitted){const doc=docs.find(d=>same(d.id,item.id));
      requireCondition(doc&&!doc.archived_at&&(!item.sha256||doc.sha256===item.sha256),409,'Submitted evidence has been removed or replaced; request updated information');
      requireCondition(doc.review_status==='verified',409,'Verify every submitted document before approving the organisation');}
@@ -172,14 +189,14 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
   const data=z.object({decision:z.enum(['verify','reject']),reason:z.string().trim().max(2000).optional()}).parse(body);
   requireCondition(data.decision==='verify'||(data.reason?.length??0)>=10,422,'A rejection reason of at least 10 characters is required');
   return transaction(async db=>{
-   const [doc]=await rows('SELECT id,uploaded_by,file_name,invoice_id,review_status,archived_at FROM documents WHERE id=$1 FOR UPDATE',[id.parse(rawId)],db);
+   const [doc]=await rows('SELECT id,uploaded_by,on_behalf_of_user_id,file_name,invoice_id,review_status,archived_at FROM documents WHERE id=$1 FOR UPDATE',[id.parse(rawId)],db);
    requireCondition(doc&&!doc.archived_at,404,'Document not found');
    requireCondition(doc.review_status==='pending',409,'This document has already been reviewed');
    requireCondition(!same(doc.uploaded_by,actor.id),403,'A different operator must review evidence you uploaded');
    const verified=data.decision==='verify';
    const [record]=await rows('UPDATE documents SET review_status=$2,review_reason=$3,verified_by=$4,verified_at=CASE WHEN $5 THEN now() ELSE NULL END,updated_at=now() WHERE id=$1 RETURNING id,file_name,review_status,review_reason,verified_at',[doc.id,verified?'verified':'rejected',data.reason??null,actor.id,verified],db);
    await portalEvent(actor,`document.${verified?'verified':'rejected'}`,data.reason??null,doc.invoice_id?String(doc.invoice_id):null,{document_id:doc.id},db);
-   if(doc.uploaded_by)await notify(String(doc.uploaded_by),verified?'Document verified':'Document rejected',verified?`${doc.file_name} was verified.`:`${doc.file_name} was rejected: ${data.reason}`,doc.invoice_id?String(doc.invoice_id):null,actor,db);
+   for(const recipient of [doc.uploaded_by,doc.on_behalf_of_user_id].filter(Boolean))await notify(String(recipient),verified?'Document verified':'Document rejected',verified?`${doc.file_name} was verified.`:`${doc.file_name} was rejected: ${data.reason}`,doc.invoice_id?String(doc.invoice_id):null,actor,db);
    return {data:record};
   });
  }

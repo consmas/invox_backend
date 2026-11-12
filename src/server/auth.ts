@@ -8,7 +8,9 @@ import { currentRequest } from './context';
 
 export const COOKIE_NAME = 'invoix_token';
 export const SESSION_SECONDS = 60 * 60 * 2;
-export type Actor = { id: string; email: string; role: Role; buyer_id: string | null; mfa_verified?: boolean };
+export type Actor = { id: string; email: string; role: Role; buyer_id: string | null; mfa_verified?: boolean;
+  /** Present when a super administrator is acting on behalf of this account's organisation. */
+  delegation?: import('./act-for').Delegation };
 export const digest = (value: string) => createHash('sha256').update(value).digest('hex');
 export const newToken = () => randomBytes(32).toString('hex');
 

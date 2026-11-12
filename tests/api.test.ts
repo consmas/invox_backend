@@ -62,7 +62,7 @@ before(async()=>{
   process.env.DOCUMENT_STORAGE_PATH=await mkdtemp(join(tmpdir(),'invox-upload-test-'));
   process.env.MFA_SECRET_KEY='a'.repeat(64);
   await admin.query(`CREATE SCHEMA "${schema}"`);
-  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql','011_security_hardening.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
+  for(const migration of ['001_next_backend.sql','002_financial_controls.sql','003_requirement_fields.sql','004_additional_control_fields.sql','005_user_profile_fields.sql','006_portal_workflows.sql','007_portal_currencies.sql','008_workflow_management.sql','009_relationship_identifiers.sql','010_document_review.sql','011_security_hardening.sql','012_field_completeness.sql','013_organisation_administration.sql','014_super_admin_delegation.sql']) await pool().query(await readFile(new URL('../db/migrations/'+migration,import.meta.url),'utf8'));
   const password=await bcrypt.hash('legacy-secret',4);
   // $2a$ is the bcrypt prefix used by existing Devise accounts.
   const legacy=password.replace('$2b$','$2a$');
@@ -405,6 +405,30 @@ test('field catalogue matches every persisted column and restricts control admin
   assert.equal((await request('GET','field-definitions/mandate_versions',undefined,tokens.buyerAdmin)).status,403);
   assert.equal((await request('GET','controls/documents',undefined,tokens.buyerAdmin)).status,403);
   assert.equal((await request('POST','controls/not_a_table',{},tokens.ops)).status,404);
+});
+test('field completeness round-trips contact titles and user job titles without inventing historical values',async()=>{
+ for(const [entity,key] of [['buyers',fixture.buyer.id],['suppliers',fixture.supplier.id],['financers',fixture.financer.id]]){
+  const title='Accounts contact '+entity;
+  const saved=await request('PATCH',`${entity}/${key}`,{contact_title:title},tokens.ops);assert.equal(saved.status,200,JSON.stringify(saved.data));
+  const loaded=await request('GET',`${entity}/${key}`,undefined,tokens.ops);assert.equal(loaded.status,200);assert.equal(loaded.data.contact_title,title);
+  const cleared=await request('PATCH',`${entity}/${key}`,{contact_title:null},tokens.ops);assert.equal(cleared.status,200,JSON.stringify(cleared.data));assert.equal(cleared.data.contact_title,null);
+ }
+ const saved=await request('PATCH',`users/${fixture.buyerAdmin.id}`,{job_title:'Finance manager'},tokens.ops);assert.equal(saved.status,200,JSON.stringify(saved.data));
+ const loaded=await request('GET',`users/${fixture.buyerAdmin.id}`,undefined,tokens.ops);assert.equal(loaded.data.job_title,'Finance manager');
+});
+test('invoice field completeness persists exact decimals and document notes through save reload edit and clear',async()=>{
+ const draft=await createInvoice('draft');
+ const form=new FormData();form.set('file',new File(['%PDF-1.4\nfield roundtrip'], 'field-roundtrip.pdf',{type:'application/pdf'}));
+ const upload=await uploadDocument(new NextRequest('http://localhost:3000/api/portal/documents',{method:'POST',headers:{cookie:`invoix_token=${tokens.buyerAdmin}`},body:form}));assert.equal(upload.status,201);const document=await upload.json();
+ const values={payment_terms:'Net 45 from acceptance',delivery_reference:'DEL-FIELDS-12',purchase_order_reference:'PO-FIELDS-12',industry:'Agriculture',country:'gh',tax_amount:'0.00',vat_amount:'12.34',financing_amount_requested:'900.01',payment_reference:'REMIT-FIELDS-12',eligibility_reason:'Goods accepted',risk_disclosures:'Subject to participation terms',supporting_documents:[{document_id:document.id,description:'Signed delivery receipt'}]};
+ const saved=await request('PATCH',`portal/manage/invoices/${draft.id}`,values,tokens.buyerAdmin);assert.equal(saved.status,200,JSON.stringify(saved.data));
+ const loaded=await request('GET',`portal/manage/invoices/${draft.id}`,undefined,tokens.buyerAdmin);assert.equal(loaded.status,200);
+ for(const [key,value]of Object.entries(values))assert.deepEqual(loaded.data[key],key==='country'?'GH':value,key);
+ const boot=await request('GET','portal/bootstrap',undefined,tokens.buyerAdmin);const displayed=boot.data.invoices.find((i:any)=>i.id===draft.id);assert.equal(displayed.payment_terms,values.payment_terms);assert.equal(displayed.vat_amount,'12.34');assert.deepEqual(displayed.supporting_documents,values.supporting_documents);
+ for(const invalid of [{vat_amount:'1.001'},{tax_amount:'-1'},{financing_amount_requested:'1000.01'},{country:'Ghana'}])assert.equal((await request('PATCH',`portal/manage/invoices/${draft.id}`,invalid,tokens.buyerAdmin)).status,422,JSON.stringify(invalid));
+ const cleared=await request('PATCH',`portal/manage/invoices/${draft.id}`,{tax_amount:null,vat_amount:null,delivery_reference:null,eligibility_reason:null},tokens.buyerAdmin);assert.equal(cleared.status,200);
+ const reloaded=await request('GET',`portal/manage/invoices/${draft.id}`,undefined,tokens.buyerAdmin);assert.equal(reloaded.data.tax_amount,null);assert.equal(reloaded.data.delivery_reference,null);
+ const newDraft=await request('POST','portal/manage/invoices',{programme_id:fixture.programme.id,supplier_id:fixture.supplier.id,invoice_number:'NO-INVENTED-FIELD-VALUES'},tokens.buyerAdmin);assert.equal(newDraft.status,201,JSON.stringify(newDraft.data));assert.equal(newDraft.data.amount,null);assert.equal(newDraft.data.due_date,null);assert.equal(newDraft.data.payment_terms,null);
 });
 test('user profile fields persist and assurance fields cannot be forged',async()=>{
  const saved=await request('PATCH',`users/${fixture.buyerAdmin.id}`,{user:{name:'Buyer administrator',contact_phone:'+233200000001',country:'gh',preferred_language:'en',timezone:'Africa/Accra',recert_cycle:6}},tokens.ops);assert.equal(saved.status,200,JSON.stringify(saved.data));assert.equal(saved.data.name,'Buyer administrator');assert.equal(saved.data.country,'GH');

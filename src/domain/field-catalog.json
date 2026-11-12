@@ -69,6 +69,13 @@
         "readOnly": false
       },
       {
+        "key": "contact_title",
+        "label": "Contact person title",
+        "type": "text",
+        "required": false,
+        "readOnly": false
+      },
+      {
         "key": "contact_email",
         "label": "Contact email",
         "type": "email",
@@ -270,6 +277,13 @@
       {
         "key": "contact_name",
         "label": "Contact name",
+        "type": "text",
+        "required": false,
+        "readOnly": false
+      },
+      {
+        "key": "contact_title",
+        "label": "Contact person title",
         "type": "text",
         "required": false,
         "readOnly": false
@@ -503,6 +517,13 @@
       {
         "key": "contact_name",
         "label": "Contact name",
+        "type": "text",
+        "required": false,
+        "readOnly": false
+      },
+      {
+        "key": "contact_title",
+        "label": "Contact person title",
         "type": "text",
         "required": false,
         "readOnly": false
@@ -969,6 +990,42 @@
         "required": false,
         "readOnly": true,
         "reference": "users"
+      },
+      {
+        "key": "activated_at",
+        "label": "Activated at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "paused_at",
+        "label": "Paused at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "archived_at",
+        "label": "Archived at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "archived_by",
+        "label": "Archived by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "archive_reason",
+        "label": "Archive reason",
+        "type": "longtext",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -1200,6 +1257,28 @@
         "type": "text",
         "required": false,
         "readOnly": true
+      },
+      {
+        "key": "cancelled_at",
+        "label": "Cancelled at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "cancelled_by",
+        "label": "Cancelled by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "cancellation_reason",
+        "label": "Cancellation reason",
+        "type": "longtext",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -1295,6 +1374,13 @@
         "readOnly": false
       },
       {
+        "key": "proposed_disbursement_date",
+        "label": "Proposed disbursement date",
+        "type": "date",
+        "required": false,
+        "readOnly": false
+      },
+      {
         "key": "payment_timing",
         "label": "Payment timing",
         "type": "text",
@@ -1339,6 +1425,13 @@
       {
         "key": "status",
         "label": "Status",
+        "type": "text",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "portal_state",
+        "label": "Submission state",
         "type": "text",
         "required": false,
         "readOnly": true
@@ -1483,6 +1576,22 @@
         "type": "text",
         "required": false,
         "readOnly": true
+      },
+      {
+        "key": "proposed_by",
+        "label": "Proposed by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "signed_by",
+        "label": "Execution verified by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
       }
     ]
   },
@@ -1610,6 +1719,22 @@
         "type": "timestamp",
         "required": false,
         "readOnly": true
+      },
+      {
+        "key": "recorded_by",
+        "label": "Recorded by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "confirmed_by",
+        "label": "Confirmed by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
       }
     ]
   },
@@ -1730,6 +1855,37 @@
         "type": "timestamp",
         "required": false,
         "readOnly": true
+      },
+      {
+        "key": "kind",
+        "label": "Transaction type",
+        "type": "text",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "reversal_of_id",
+        "label": "Reverses receipt",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "repayments"
+      },
+      {
+        "key": "recorded_by",
+        "label": "Recorded by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "confirmed_by",
+        "label": "Confirmed by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
       }
     ]
   },
@@ -3266,6 +3422,28 @@
         "type": "timestamp",
         "required": false,
         "readOnly": true
+      },
+      {
+        "key": "uploaded_by",
+        "label": "Uploaded by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "review_status",
+        "label": "Review status",
+        "type": "text",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "review_reason",
+        "label": "Review reason",
+        "type": "longtext",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -4259,6 +4437,36 @@
         "required": false,
         "readOnly": true,
         "default": "draft"
+      },
+      {
+        "key": "accepted_bid_id",
+        "label": "Accepted offer",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "bids"
+      },
+      {
+        "key": "cancelled_at",
+        "label": "Cancelled at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "cancelled_by",
+        "label": "Cancelled by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "cancellation_reason",
+        "label": "Cancellation reason",
+        "type": "longtext",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -4486,6 +4694,21 @@
         "required": false,
         "readOnly": true,
         "default": "draft"
+      },
+      {
+        "key": "approved_by",
+        "label": "Approved by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "approved_at",
+        "label": "Approved at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -4743,6 +4966,13 @@
         "required": false,
         "readOnly": true,
         "default": "draft"
+      },
+      {
+        "key": "approved_at",
+        "label": "Approved at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -4892,6 +5122,28 @@
         "required": false,
         "readOnly": true,
         "default": "draft"
+      },
+      {
+        "key": "reviewed_by",
+        "label": "Reviewed by",
+        "type": "reference",
+        "required": false,
+        "readOnly": true,
+        "reference": "users"
+      },
+      {
+        "key": "reviewed_at",
+        "label": "Reviewed at",
+        "type": "timestamp",
+        "required": false,
+        "readOnly": true
+      },
+      {
+        "key": "review_note",
+        "label": "Review note",
+        "type": "longtext",
+        "required": false,
+        "readOnly": true
       }
     ]
   },
@@ -10944,6 +11196,13 @@
       {
         "key": "name",
         "label": "Name",
+        "type": "text",
+        "required": false,
+        "readOnly": false
+      },
+      {
+        "key": "job_title",
+        "label": "Job title",
         "type": "text",
         "required": false,
         "readOnly": false

@@ -19,11 +19,13 @@ async function seed() {
     const [existing] = await rows('SELECT role FROM users WHERE lower(email)=$1',[address],db);
     if (existing) {
       if (existing.role !== 2) throw new Error('Email already belongs to another role; no changes made');
-      console.log('Platform operator already exists; password unchanged');
+      // The seeded administrator is the super administrator: the only account that may act for organisations.
+      await rows('UPDATE users SET super_admin=true WHERE lower(email)=$1',[address],db);
+      console.log('Platform operator already exists; password unchanged; super administrator access confirmed');
       return;
     }
-    await insert('users',{email:address,encrypted_password:await hashPassword(secret),role:2,jti:randomUUID()},db);
-    console.log('Created platform operator');
+    await insert('users',{email:address,encrypted_password:await hashPassword(secret),role:2,jti:randomUUID(),super_admin:true},db);
+    console.log('Created platform operator with super administrator access');
   });
 }
 seed().catch(error => { console.error(error.message); process.exitCode=1; }).finally(closePool);

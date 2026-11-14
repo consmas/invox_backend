@@ -244,3 +244,40 @@ test('F24: operations sessions are enrolment-only until an authenticator is veri
     assert.equal((await request('GET', 'portal/manage/users', undefined, tokens.ops)).status, 200);
   } finally { delete process.env.REQUIRE_OPERATIONS_MFA; }
 });
+
+test('a trusted browser skips the authenticator code until trust is forgotten or the password changes', async () => {
+  const user = await insert('users', { email: 'trusted@example.test', name: 'Trusted', encrypted_password: await bcrypt.hash('legacy-secret', 4), role: 2, jti: randomUUID() });
+  const signIn = (password = 'legacy-secret', device?: string) => request('POST', 'auth/login', { email: user.email, password }, undefined, device ? { cookie: `invox_trusted_device=${device}` } : {});
+  const setup = await request('POST', 'portal-auth/mfa-setup', { password: 'legacy-secret' }, await login(user.email));
+  const secret = decodeSecret(setup.data.secret);
+  const now = Math.floor(Date.now() / 30000);
+  assert.equal((await request('POST', 'portal-auth/mfa-enrol', { code: totp(secret, now - 1) }, cookie(await signIn(), 'invoix_token'))).status, 200);
+  const trustWith = async (step: number, password = 'legacy-secret') => {
+    const challenge = cookie(await signIn(password), 'invox_mfa_challenge')!;
+    const verified = await request('POST', 'portal-auth/mfa-verify', { code: totp(secret, step), trust_device: true }, undefined, { cookie: `invox_mfa_challenge=${challenge}` });
+    assert.equal(verified.status, 200, JSON.stringify(verified.data));
+    assert.equal(verified.data.trusted, true);
+    return { device: cookie(verified, 'invox_trusted_device')!, session: cookie(verified, 'invoix_token')! };
+  };
+  const { device, session } = await trustWith(now);
+  assert.match(device, /^[a-f0-9]{64}$/);
+  assert.equal((await rows('SELECT token_hash FROM trusted_devices WHERE user_id=$1', [user.id]))[0].token_hash === device, false, 'only a hash is stored');
+  // Trusted browser: password only, and the session counts as verified. Other browsers still need the code.
+  const skipped = await signIn('legacy-secret', device);
+  assert.equal(skipped.status, 200);
+  assert.equal(skipped.data.mfa_required, undefined);
+  const [stored] = await rows('SELECT mfa_verified_at FROM app_sessions WHERE token_hash=encode(sha256($1::bytea),\'hex\')', [cookie(skipped, 'invoix_token')]);
+  assert.ok(stored.mfa_verified_at);
+  assert.equal((await signIn()).data.mfa_required, true);
+  assert.equal((await signIn('wrong-password-1', device)).status, 401);
+  assert.equal((await request('GET', 'portal-auth/trusted-devices', undefined, session)).data.count, 1);
+  // Forgetting trusted browsers brings the code back.
+  assert.equal((await request('DELETE', 'portal-auth/trusted-devices', undefined, session)).status, 200);
+  assert.equal((await signIn('legacy-secret', device)).data.mfa_required, true);
+  // A password change ends trust as well.
+  const again = await trustWith(now + 1);
+  assert.equal((await signIn('legacy-secret', again.device)).data.mfa_required, undefined);
+  const changed = await request('POST', 'auth/change-password', { current_password: 'legacy-secret', password: 'rotated-password-456', password_confirmation: 'rotated-password-456' }, again.session);
+  assert.equal(changed.status, 200, JSON.stringify(changed.data));
+  assert.equal((await signIn('rotated-password-456', again.device)).data.mfa_required, true);
+});

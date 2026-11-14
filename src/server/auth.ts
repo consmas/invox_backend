@@ -67,6 +67,7 @@ export async function createSession(user: Row, db: DB, mfaVerified = false): Pro
 export async function revokeSessions(userId: string, db: DB) {
   await rows('DELETE FROM app_sessions WHERE user_id=$1', [userId], db);
   await rows('DELETE FROM portal_mfa_challenges WHERE user_id=$1', [userId], db);
+  await rows('DELETE FROM trusted_devices WHERE user_id=$1', [userId], db);
   await rows('UPDATE users SET jti=$2, updated_at=now() WHERE id=$1', [userId, randomUUID()], db);
 }
 export function verifyOrigin(req: NextRequest) {

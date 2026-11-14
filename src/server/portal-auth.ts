@@ -8,6 +8,7 @@ import {email,password} from './validation';
 import {requireCondition,ApiError} from './errors';
 import {sendLink,appUrl} from './mail';
 import {orgRef,portalEvent,sessionData} from './portal';
+import {trustDevice,trustedDeviceCount,trustedDeviceDays,forgetTrustedDevices,TRUSTED_DEVICE_COOKIE} from './trusted-devices';
 function session(response:NextResponse,token:string,remember=true){response.cookies.set(COOKIE_NAME,token,{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax',path:'/',maxAge:remember?SESSION_SECONDS:undefined});return response;}
 function key(){const k=process.env.MFA_SECRET_KEY;requireCondition(k&&/^[a-f0-9]{64}$/i.test(k),503,'Authenticator encryption is not configured');return Buffer.from(k,'hex');}
 function seal(value:Buffer){const iv=randomBytes(12);const cipher=createCipheriv('aes-256-gcm',key(),iv);const data=Buffer.concat([cipher.update(value),cipher.final()]);return Buffer.concat([iv,cipher.getAuthTag(),data]).toString('base64');}
@@ -30,14 +31,23 @@ export async function portalAuth(req:NextRequest,action:string,body:Row,onBehalf
   const result=await transaction(async db=>{const user=await insert('users',{email:data.email,name:data.name,encrypted_password:await hashPassword(data.password),role:0,buyer_id:null,jti:randomUUID(),portal_registration:true},db);return {token:await createSession(user,db)};});return session(NextResponse.json({ok:true},{status:201}),result.token);
  }
  if(action==='mfa-verify'&&req.method==='POST'){
-  const code=z.string().regex(/^\d{6}$/).parse(body.code);const token=req.cookies.get('invox_mfa_challenge')?.value;requireCondition(token,401,'Sign in again to request a new challenge');await rateLimit(`mfa:${digest(token)}`,5);
+  const code=z.string().regex(/^\d{6}$/).parse(body.code);const trust=body.trust_device===true;const token=req.cookies.get('invox_mfa_challenge')?.value;requireCondition(token,401,'Sign in again to request a new challenge');await rateLimit(`mfa:${digest(token)}`,5);
   const result=await transaction(async db=>{
    // The challenge is valid only for the credential epoch it was issued under; password changes and revocations rotate jti.
    const [challenge]=await rows('SELECT c.*,u.mfa_secret_encrypted,u.mfa_enrolled_at,u.jti,u.disabled_at FROM portal_mfa_challenges c JOIN users u ON u.id=c.user_id WHERE c.token_hash=$1 AND c.expires_at>now() FOR UPDATE OF c,u',[digest(token)],db);
    requireCondition(challenge&&challenge.mfa_enrolled_at&&!challenge.disabled_at&&challenge.user_jti===challenge.jti,422,'Invalid or expired authenticator code');
    requireCondition(await consumeCode(String(challenge.user_id),challenge.mfa_secret_encrypted,code,db),422,'Invalid or expired authenticator code');
    await rows('DELETE FROM portal_mfa_challenges WHERE token_hash=$1',[digest(token)],db);
-   return createSession({id:challenge.user_id,jti:challenge.jti},db,true);});const response=session(NextResponse.json({ok:true}),result,req.cookies.get('invox_mfa_remember')?.value!=='0');response.cookies.delete('invox_mfa_challenge');response.cookies.delete('invox_mfa_remember');return response;
+   const sessionToken=await createSession({id:challenge.user_id,jti:challenge.jti},db,true);
+   return {token:sessionToken,user:{id:challenge.user_id,jti:challenge.jti}};});
+  const response=session(NextResponse.json({ok:true,trusted:trust&&trustedDeviceDays()>0}),result.token,req.cookies.get('invox_mfa_remember')?.value!=='0');
+  if(trust)await trustDevice(response,req,result.user);response.cookies.delete('invox_mfa_challenge');response.cookies.delete('invox_mfa_remember');return response;
+ }
+ if(action==='trusted-devices'&&['GET','DELETE'].includes(req.method)){
+  const me=await authenticate(req);
+  if(req.method==='GET')return NextResponse.json({count:await trustedDeviceCount(me.id),days:trustedDeviceDays()});
+  await forgetTrustedDevices(me.id);await portalEvent(me,'mfa.trusted_devices_forgotten');
+  const response=NextResponse.json({forgotten:true});response.cookies.delete(TRUSTED_DEVICE_COOKIE);return response;
  }
  // A super administrator completing onboarding for a registrant arrives with the registrant's delegated actor.
  const actor=onBehalf??await authenticate(req);

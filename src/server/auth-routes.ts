@@ -7,6 +7,7 @@ import { COOKIE_NAME, SESSION_SECONDS, actorForToken, createSession, digest, has
 import { email, password } from './validation';
 import { coreSchema,databaseValues } from './fields';
 import {challengeFor} from './portal-auth';
+import { isTrustedDevice } from './trusted-devices';
 import { appUrl, requireMailConfiguration, sendLink } from './mail';
 
 function withSession(response: NextResponse, token: string,remember=true) {
@@ -30,11 +31,13 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
     const valid = !user?.disabled_at && user?.encrypted_password && await verifyPassword(data.password, user.encrypted_password);
     if (!user) await hashPassword('invalid-credentials-timing-padding');
     requireCondition(valid, 401, 'Invalid email or password');
-    if(user.mfa_enrolled_at)return challengeFor(user,data.remember);
+    // A browser trusted after an earlier authenticator code skips the code; the password is always required.
+    const trusted = !!user.mfa_enrolled_at && await isTrustedDevice(req, user);
+    if(user.mfa_enrolled_at&&!trusted)return challengeFor(user,data.remember);
     const token = await transaction(async db => {
       const [locked] = await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE', [user.id], db);
       requireCondition(locked && locked.encrypted_password === user.encrypted_password, 401, 'Invalid email or password');
-      return createSession(locked, db);
+      return createSession(locked, db, trusted);
     });
     return withSession(NextResponse.json({ ok: true, user: publicUser(user) }), token,data.remember);
   }

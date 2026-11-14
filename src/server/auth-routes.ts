@@ -1,13 +1,12 @@
-import { randomUUID } from 'node:crypto';
 import { z } from 'zod';
 import { NextRequest, NextResponse } from 'next/server';
-import { rows, insert, update, transaction } from './db';
+import { rows, update, transaction } from './db';
 import { ApiError, requireCondition } from './errors';
 import { COOKIE_NAME, SESSION_SECONDS, actorForToken, createSession, digest, hashPassword, newToken, publicUser, rateLimit, requestToken, revokeSessions, verifyPassword } from './auth';
 import { email, password } from './validation';
-import { coreSchema,databaseValues } from './fields';
 import {challengeFor} from './portal-auth';
 import { isTrustedDevice } from './trusted-devices';
+import { invitationDetails, registerInvitedSupplier } from './onboarding/supplier';
 import { appUrl, requireMailConfiguration, sendLink } from './mail';
 
 function withSession(response: NextResponse, token: string,remember=true) {
@@ -45,25 +44,12 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
     const data = z.object({ email, password, password_confirmation:z.string().optional(), role:z.string().default('buyer_admin'),
       invite_token:z.string().optional(), name:z.string().optional(), registration_number:z.string().optional(), address:z.string().optional(),country:z.string().optional() }).parse(body);
     requireCondition(!data.password_confirmation || data.password === data.password_confirmation, 422, 'Passwords do not match');
+    // Only a supplier invited by its anchor signs up here; every other account is set up by invitation.
+    requireCondition(data.invite_token, 403, 'INVOX accounts are set up by invitation. Contact us to onboard your organisation.');
     await rateLimit(`signup:${data.email}`, 5);
     const result = await transaction(async db => {
-      const hash = await hashPassword(data.password);
-      let user;
-      if (data.invite_token) {
-        requireCondition(data.role === 'supplier_user', 403, 'Invitation is for a supplier account');
-        const [supplier] = await rows(`SELECT * FROM suppliers WHERE invitation_token=$1 AND invitation_expires_at>now() FOR UPDATE`, [digest(data.invite_token)], db);
-        requireCondition(supplier && supplier.email.toLowerCase() === data.email, 422, 'Invitation is invalid or expired');
-        const [account] = await rows('SELECT * FROM users WHERE id=$1 AND role=1 FOR UPDATE', [supplier.user_id], db);
-        requireCondition(account, 422, 'Invitation is invalid');
-        await revokeSessions(String(account.id), db);
-        user = await update('users', String(account.id), { encrypted_password:hash,email_verified_at:new Date() }, db);
-        await update('suppliers', String(supplier.id), { invitation_token:null, invitation_expires_at:null }, db);
-      } else {
-        requireCondition(data.role === 'buyer_admin', 403, 'Public signup is available only for a new buyer organization');
-        const company = coreSchema('buyers').parse({ name:data.name, registration_number:data.registration_number, address:data.address, contact_email:data.email,country:data.country });
-        const buyer = await insert('buyers', databaseValues('buyers',company), db);
-        user = await insert('users', { email:data.email, encrypted_password:hash, role:0, buyer_id:buyer.id, jti:randomUUID(),portal_registration:true }, db);
-      }
+      requireCondition(data.role === 'supplier_user', 403, 'Invitation is for a supplier account');
+      const user = await registerInvitedSupplier({ email: data.email, password: data.password, token: data.invite_token!, name: data.name }, db);
       return { user:publicUser(user), token:await createSession(user, db) };
     });
     return withSession(NextResponse.json({ ok:true, user:result.user }, { status:201 }), result.token);
@@ -114,10 +100,7 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
     return withSession(NextResponse.json({ ok:true }), token);
   }
   if (action === 'invite' && req.method === 'GET') {
-    const token = req.nextUrl.searchParams.get('token') ?? '';
-    const [supplier] = await rows(`SELECT name,email FROM suppliers WHERE invitation_token=$1 AND invitation_expires_at>now()`, [digest(token)]);
-    requireCondition(supplier, 404, 'Invitation is invalid or expired');
-    return NextResponse.json(supplier);
+    return NextResponse.json(await invitationDetails(req.nextUrl.searchParams.get('token') ?? ''));
   }
   throw new ApiError(['login','logout','signup','me','password','forgot-password','reset-password','invite','change-password'].includes(action) ? 405 : 404, 'Not found or method not allowed');
 }

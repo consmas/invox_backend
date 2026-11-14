@@ -4,15 +4,15 @@ import {z} from 'zod';
 import {type Actor,requireRole} from './auth';
 import {rows,transaction,insert,type DB,type Row} from './db';
 import {requireCondition,ApiError} from './errors';
-import {id,date,email,money} from './validation';
+import {id,date,money} from './validation';
 import {coreSchema,databaseValues} from './fields';
 import {priceBid,resourceRequest} from './resources';
 import {cents} from './money';
-import {digest,newToken} from './auth';
-import {sendLink,appUrl} from './mail';
 import {orgRef,portalEvent,notify,sessionData} from './portal-support';
 import {preparedOnBehalfBy} from './act-for';
 import {integrationsRequest} from './integrations';
+import {setupRequest} from './onboarding/setup';
+import {inviteSupplier} from './onboarding/supplier';
 export {orgRef,portalEvent,sessionData} from './portal-support';
 const same=(a:unknown,b:unknown)=>String(a)===String(b);
 // Field policy (F09): counterparties receive only the identity and terms needed to act; private legal, fee,
@@ -87,6 +87,7 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
  const [,resource,rawId,action]=path;
  if(resource==='manage'||resource==='modules')return managementRequest(actor,method,path,body);
  if(resource==='integrations')return integrationsRequest(actor,method,path,body);
+ if(resource==='setup')return setupRequest(actor,method,path,body);
  if(method==='GET'&&resource==='session')return {data:await sessionData(actor)};
  if(method==='GET'&&resource==='bootstrap')return {data:await bootstrap(actor)};
  if(resource==='profile'&&method==='PATCH'){
@@ -146,35 +147,10 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
  if(resource==='bids'&&rawId&&action==='withdraw'&&method==='POST'){
   requireRole(actor,'financer','platform_ops');return transaction(async db=>{const [bid]=await rows("UPDATE bids SET status=2,portal_state='WITHDRAWN',updated_at=now() WHERE id=$1 AND (financer_id=$2 OR $3) AND status=0 RETURNING *",[id.parse(rawId),actor.id,actor.role==='platform_ops'],db);requireCondition(bid,409,'This offer cannot be withdrawn');await portalEvent(actor,'bid.withdrawn',null,bid.invoice_id,{bid_id:bid.id},db);return {data:bid};});
  }
- if(resource==='programmes'&&method==='POST'){
-  requireRole(actor,'buyer_admin','platform_ops');
-  const data=z.object({name:z.string().min(2),currency:z.enum(['GHS','USD','EUR','NGN','KES']),limit:money,max_tenor_days:z.number().int().min(1).max(3650),supplier_ids:z.array(id),financier_ids:z.array(id)}).parse(body);
-  requireCondition(actor.buyer_id,422,'Create programmes from the buyer organisation workspace');
-  return transaction(async db=>{
-   for(const supplier of data.supplier_ids)requireCondition((await rows("SELECT 1 FROM portal_supplier_relationships r JOIN suppliers s ON s.id=r.supplier_id WHERE r.buyer_id=$1 AND r.supplier_id=$2 AND r.status='active' AND s.archived_at IS NULL",[actor.buyer_id,supplier],db)).length,403,'Invite this supplier before adding it to a programme');
-   for(const financer of data.financier_ids)requireCondition((await rows('SELECT 1 FROM users u JOIN financier_profiles f ON f.user_id=u.id WHERE u.id=$1 AND u.role=3 AND u.disabled_at IS NULL AND f.archived_at IS NULL',[financer],db)).length,422,'Financier is missing or archived');
-   const [programme]=await rows("INSERT INTO programmes(buyer_id,name,\"limit\",fee_percent,maturity_days,programme_reference,currency,maximum_tenor_days,day_count_basis,status) VALUES($1,$2,$3,0,$4,$5,$6,$4,'365','draft') RETURNING *",[actor.buyer_id,data.name,data.limit,data.max_tenor_days,`PRG-${randomUUID().slice(0,8)}`,data.currency],db);
-   for(const supplier of data.supplier_ids)await rows('INSERT INTO portal_programme_suppliers VALUES($1,$2)',[programme.id,supplier],db);
-   for(const financer of data.financier_ids)await rows('INSERT INTO portal_programme_financiers VALUES($1,$2)',[programme.id,financer],db);
-   await portalEvent(actor,'programme.created',null,null,{programme_id:programme.id},db);return {data:programme,status:201};
-  });
- }
- if(resource==='suppliers'&&method==='POST'){
-  requireRole(actor,'buyer_admin','platform_ops');
-  const data=z.object({name:z.string().min(2),email,country:z.string().length(2).default('GH'),contact:z.string().max(200).optional(),programme_id:id}).parse(body);
-  return transaction(async db=>{
-   const [programme]=await rows('SELECT * FROM programmes WHERE id=$1',[data.programme_id],db);requireCondition(programme&&(actor.role==='platform_ops'||same(programme.buyer_id,actor.buyer_id)),403,'Programme is outside your organisation');requireCondition(!programme.archived_at,409,'Programme is archived');
-   let [supplier]=await rows('SELECT * FROM suppliers WHERE lower(email)=$1',[data.email],db);
-   requireCondition(!supplier?.archived_at,409,'This supplier is archived; restore it before adding it to a programme');
-   let delivery:Row={};
-   if(!supplier){
-    const token=newToken();const user=await insert('users',{email:data.email,role:1,jti:randomUUID(),encrypted_password:'!invitation-pending',portal_registration:true},db);
-    supplier=await insert('suppliers',{name:data.name,email:data.email,country:data.country,user_id:user.id,invitation_token:digest(token),invited_at:new Date(),invitation_expires_at:new Date(Date.now()+7*86400000)},db);
-    delivery=await sendLink(data.email,'Your INVOX supplier invitation',`${appUrl()}/invite?token=${token}`);
-   }
-   await rows('INSERT INTO portal_programme_suppliers VALUES($1,$2) ON CONFLICT DO NOTHING',[programme.id,supplier.id],db);await rows('INSERT INTO portal_supplier_relationships(buyer_id,supplier_id,contact_name,contact_email,created_by) VALUES($1,$2,$3,$4,$5) ON CONFLICT(buyer_id,supplier_id) DO UPDATE SET contact_name=coalesce(EXCLUDED.contact_name,portal_supplier_relationships.contact_name),contact_email=EXCLUDED.contact_email,updated_at=now()',[programme.buyer_id,supplier.id,data.contact??null,data.email,actor.id],db);await portalEvent(actor,'supplier.invited',null,null,{supplier_id:supplier.id},db);return {data:{id:supplier.id,...delivery},status:201};
-  });
- }
+ // Programmes are configured by operations from the executed agreement (set-up step 3), never by the anchor.
+ if(resource==='programmes'&&method==='POST')throw new ApiError(403,'Programmes are configured by INVOX operations from the executed programme agreement');
+ // S1: the anchor (or Syndicate) invites a supplier onto a live programme by email or SMS; existing suppliers are linked, never duplicated.
+ if(resource==='suppliers'&&method==='POST'){requireRole(actor,'buyer_admin','platform_ops');return {data:await inviteSupplier(actor,body),status:201};}
  if(resource==='verification'&&rawId&&method==='POST'){
   requireRole(actor,'platform_ops');const data=z.object({status:z.enum(['APPROVED','REJECTED','INFO_REQUIRED']),note:z.string().trim().max(4000).optional()}).parse(body);requireCondition(data.status==='APPROVED'||data.note&&data.note.length>=5,422,'A reason is required');
   return transaction(async db=>{const [review]=await rows('SELECT * FROM portal_org_reviews WHERE org_ref=$1 FOR UPDATE',[rawId],db);requireCondition(review,409,'This organisation has not submitted its onboarding evidence');requireCondition(!same(review.submitted_by,actor.id)&&!await preparedOnBehalfBy(actor.id,'onboarding',rawId,db),403,'A different operator must review the submission');

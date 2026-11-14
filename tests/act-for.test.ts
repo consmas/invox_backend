@@ -108,25 +108,27 @@ test('acting for a buyer runs under the buyer scope, logs every change and notif
   // Personal account settings stay with the organisation's users.
   assert.equal((await request('PATCH', 'portal/profile', { name: 'Changed by admin' }, tokens.superAdmin, started.cookie)).status, 403);
 
-  const programme = await request('POST', 'portal/programmes', { name: 'Admin-entered programme', currency: 'GHS', limit: '50000', max_tenor_days: 90, supplier_ids: [fx.supplier.id], financier_ids: [fx.financer.id] }, tokens.superAdmin, started.cookie);
-  assert.equal(programme.status, 201, JSON.stringify(programme.data));
-  assert.equal(String(programme.data.buyer_id), String(fx.buyer.id));
-  const [event] = await rows("SELECT * FROM portal_events WHERE event='programme.created' ORDER BY id DESC LIMIT 1");
+  // A change made for the buyer (programmes themselves are configured by operations, not the anchor).
+  const [relationship] = await rows('SELECT id FROM portal_supplier_relationships WHERE buyer_id=$1 AND supplier_id=$2', [fx.buyer.id, fx.supplier.id]);
+  const edited = await request('PATCH', `portal/manage/supplier_relationships/${relationship.id}`, { contact_name: 'Admin-entered contact' }, tokens.superAdmin, started.cookie);
+  assert.equal(edited.status, 200, JSON.stringify(edited.data));
+  const [event] = await rows("SELECT * FROM portal_events WHERE event='supplier_relationships.updated' ORDER BY id DESC LIMIT 1");
   assert.equal(String(event.actor_id), String(fx.buyerAdmin.id));
   assert.equal(String(event.acting_admin_id), String(fx.superAdmin.id));
-  const [log] = await rows("SELECT * FROM organisation_admin_events WHERE operation='POST portal/programmes'");
+  const [log] = await rows("SELECT * FROM organisation_admin_events WHERE operation=$1", [`PATCH portal/manage/supplier_relationships/${relationship.id}`]);
   assert.equal(log.org_ref, `buyer-${fx.buyer.id}`);
   assert.equal(String(log.actor_id), String(fx.superAdmin.id));
   assert.equal(log.reason, 'Customer asked us to load records by phone');
   for (const user of [fx.buyerAdmin, fx.buyerColleague]) {
     const [notice] = await rows("SELECT * FROM notifications WHERE user_id=$1 AND event_type='admin_on_behalf' ORDER BY id DESC", [user.id]);
-    assert.match(notice.body, /acted on behalf of Acme Buyer: Created programme/);
+    assert.match(notice.body, /acted on behalf of Acme Buyer: Updated supplier relationship/);
   }
   await assert.rejects(rows('DELETE FROM organisation_admin_events'), /append-only|immutable|not permitted|refuse/i);
 
-  // A failed action is neither logged nor notified.
+  // A failed action is neither logged nor notified; programme set-up is refused for the anchor.
   const before = (await rows('SELECT count(*)::int AS n FROM organisation_admin_events'))[0].n;
-  assert.equal((await request('POST', 'portal/programmes', { name: 'x' }, tokens.superAdmin, started.cookie)).status, 422);
+  assert.equal((await request('PATCH', `portal/manage/supplier_relationships/${relationship.id}`, { not_a_field: 'x' }, tokens.superAdmin, started.cookie)).status, 422);
+  assert.equal((await request('POST', 'portal/programmes', { name: 'Admin-entered programme' }, tokens.superAdmin, started.cookie)).status, 403);
   assert.equal((await rows('SELECT count(*)::int AS n FROM organisation_admin_events'))[0].n, before);
 
   // Uploading for the organisation: the administrator remains the uploader and the organisation can use the file.
@@ -153,8 +155,8 @@ test('acting for a buyer runs under the buyer scope, logs every change and notif
 });
 
 test('the super administrator completes onboarding for a registrant; a different operator must approve it', async () => {
-  const signup = await request('POST', 'portal-auth/register', { name: 'Registrant', email: 'registrant@example.test', password: 'Portal-password-123' });
-  assert.equal(signup.status, 201);
+  // Registration is closed; an invited applicant that has not completed onboarding.
+  await insert('users', { email: 'registrant@example.test', name: 'Registrant', encrypted_password: await bcrypt.hash('Portal-password-123', 4), role: 0, jti: randomUUID(), portal_registration: true });
   const registrant = (await rows("SELECT id FROM users WHERE email='registrant@example.test'"))[0];
   const listed = await request('GET', 'portal/bootstrap', undefined, tokens.superAdmin);
   assert.ok(listed.data.registrations.some((r: any) => String(r.id) === String(registrant.id)));

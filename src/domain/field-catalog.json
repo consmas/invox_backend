@@ -770,6 +770,18 @@
         ]
       },
       {
+        "key": "financing_model",
+        "label": "Financing model",
+        "type": "text",
+        "required": true,
+        "readOnly": false,
+        "options": [
+          "early_payment",
+          "tender"
+        ],
+        "default": "early_payment"
+      },
+      {
         "key": "payment_terms",
         "label": "Payment terms",
         "type": "text",

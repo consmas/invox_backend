@@ -9,6 +9,8 @@ import { currentRequest } from './context';
 export const COOKIE_NAME = 'invoix_token';
 export const SESSION_SECONDS = 60 * 60 * 2;
 export type Actor = { id: string; email: string; role: Role; buyer_id: string | null; mfa_verified?: boolean;
+  /** The person's role inside their organisation (SRS §13.5–13.7), e.g. approver, viewer, credit_officer. */
+  org_role?: string | null;
   /** Present when a super administrator is acting on behalf of this account's organisation. */
   delegation?: import('./act-for').Delegation };
 export const digest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -30,7 +32,7 @@ export const hashPassword = (value: string) => bounded(() => bcrypt.hash(value, 
 // Devise's default bcrypt hashes ($2a$/$2b$) remain valid, including legacy short passwords.
 export const verifyPassword = (value: string, hash: string) => bounded(() => bcrypt.compare(value, hash));
 export function publicUser(user: Row): Actor {
-  return { id: String(user.id), email: user.email, role: roles[Number(user.role)], buyer_id: user.buyer_id == null ? null : String(user.buyer_id) };
+  return { id: String(user.id), email: user.email, role: roles[Number(user.role)], buyer_id: user.buyer_id == null ? null : String(user.buyer_id), org_role: user.org_role ?? null };
 }
 export function requestToken(req: NextRequest): string | undefined {
   return req.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1] ?? req.cookies.get(COOKIE_NAME)?.value;

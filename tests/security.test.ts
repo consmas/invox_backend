@@ -79,10 +79,11 @@ after(async () => {
   await admin.end();
 });
 
-test('F01: unverified self-registration and orphaned buyer accounts never fall back to an unrestricted scope', async () => {
-  const signup = await request('POST', 'portal-auth/register', { name: 'Fresh applicant', email: 'fresh@example.test', password: 'Fresh-password-123' });
-  assert.equal(signup.status, 201);
-  const fresh = cookie(signup, 'invoix_token')!;
+test('F01: unverified applicants and orphaned buyer accounts never fall back to an unrestricted scope', async () => {
+  // Public registration is closed; an applicant that has not completed verification is created directly.
+  assert.equal((await request('POST', 'portal-auth/register', { name: 'Fresh applicant', email: 'fresh@example.test', password: 'Fresh-password-123' })).status, 403);
+  await insert('users', { email: 'fresh@example.test', name: 'Fresh applicant', encrypted_password: await bcrypt.hash('Fresh-password-123', 4), role: 0, jti: randomUUID(), portal_registration: true });
+  const fresh = await login('fresh@example.test', 'Fresh-password-123');
   for (const path of ['portal/manage/programmes', 'portal/manage/supplier_relationships', 'programmes', 'suppliers', 'invoices', `programmes/${fx.programmeB.id}`, 'portal/manage/programmes/options/financers'])
     assert.equal((await request('GET', path, undefined, fresh)).status, 403, path);
   const bundle = await request('GET', 'portal/bootstrap', undefined, fresh);

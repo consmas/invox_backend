@@ -8,6 +8,7 @@ import {email,password} from './validation';
 import {requireCondition,ApiError} from './errors';
 import {sendLink,appUrl} from './mail';
 import {orgRef,portalEvent,sessionData} from './portal';
+import {invitationFor} from './onboarding/invitations';
 import {trustDevice,trustedDeviceCount,trustedDeviceDays,forgetTrustedDevices,TRUSTED_DEVICE_COOKIE} from './trusted-devices';
 function session(response:NextResponse,token:string,remember=true){response.cookies.set(COOKIE_NAME,token,{httpOnly:true,secure:process.env.NODE_ENV==='production',sameSite:'lax',path:'/',maxAge:remember?SESSION_SECONDS:undefined});return response;}
 function key(){const k=process.env.MFA_SECRET_KEY;requireCondition(k&&/^[a-f0-9]{64}$/i.test(k),503,'Authenticator encryption is not configured');return Buffer.from(k,'hex');}
@@ -26,9 +27,26 @@ export async function portalAuth(req:NextRequest,action:string,body:Row,onBehalf
   if(sender){body.email=sender.email;body.name=sender.email;}
   const data=z.object({name:z.string().trim().min(2).max(200),email,company:z.string().max(200).optional(),subject:z.string().max(200).optional(),message:z.string().trim().min(10).max(10000)}).parse(body);await rateLimit(`contact:${data.email}`,5);await rows('INSERT INTO portal_messages(name,email,company,subject,body) VALUES($1,$2,$3,$4,$5)',[data.name,data.email,data.company??null,data.subject??null,data.message]);return NextResponse.json({received:true},{status:201});
  }
- if(action==='register'&&req.method==='POST'){
-  const data=z.object({email,password,name:z.string().trim().min(3).max(200)}).parse(body);await rateLimit(`register:${data.email}`,5);
-  const result=await transaction(async db=>{const user=await insert('users',{email:data.email,name:data.name,encrypted_password:await hashPassword(data.password),role:0,buyer_id:null,jti:randomUUID(),portal_registration:true},db);return {token:await createSession(user,db)};});return session(NextResponse.json({ok:true},{status:201}),result.token);
+ // Accounts are set up by invitation only: anchors and funders by INVOX operations, suppliers by their anchor.
+ if(action==='register'&&req.method==='POST')throw new ApiError(403,'INVOX accounts are set up by invitation. Contact us to onboard your organisation.');
+ if(action==='invitation'&&req.method==='GET'){
+  const {invitation,organisation}=await invitationFor(req.nextUrl.searchParams.get('token')??'');
+  return NextResponse.json({email:invitation.email,name:invitation.name,organisation});
+ }
+ if(action==='accept-invitation'&&req.method==='POST'){
+  const data=z.object({token:z.string().max(128),password,password_confirmation:z.string().optional()}).parse(body);
+  requireCondition(!data.password_confirmation||data.password===data.password_confirmation,422,'Passwords do not match');
+  await rateLimit(`reset-token:${digest(data.token)}`,5);
+  const token=await transaction(async db=>{
+   const {invitation}=await invitationFor(data.token);
+   const [user]=await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE',[invitation.user_id],db);
+   requireCondition(user&&String(user.encrypted_password).startsWith('!'),404,'This invitation is invalid or has expired');
+   await rows('UPDATE user_invitations SET accepted_at=now() WHERE id=$1',[invitation.id],db);
+   const [updated]=await rows('UPDATE users SET encrypted_password=$2,email_verified_at=coalesce(email_verified_at,now()),jti=$3,updated_at=now() WHERE id=$1 RETURNING *',[user.id,await hashPassword(data.password),randomUUID()],db);
+   await portalEvent({id:String(user.id),email:user.email,role:'buyer_admin',buyer_id:null},'invitation.accepted',null,null,{org_ref:invitation.org_ref},db);
+   return createSession(updated,db);
+  });
+  return session(NextResponse.json({ok:true},{status:201}),token);
  }
  if(action==='mfa-verify'&&req.method==='POST'){
   const code=z.string().regex(/^\d{6}$/).parse(body.code);const trust=body.trust_device===true;const token=req.cookies.get('invox_mfa_challenge')?.value;requireCondition(token,401,'Sign in again to request a new challenge');await rateLimit(`mfa:${digest(token)}`,5);

@@ -9,6 +9,8 @@ import { resourceRequest, invoiceList, lockOperatorSet } from './resources';
 import { assertFresh } from './context';
 import { portalEvent, notify } from './portal-support';
 import { preparedOnBehalfBy } from './act-for';
+import { programmeReleaseProblem } from './onboarding/programme';
+import { enrolled } from './onboarding/supplier';
 import { cents } from './money';
 type Module = {
     key: string;
@@ -93,6 +95,8 @@ export async function validateInvoiceSubmission(actor: Actor, record: Row, db: D
     requireCondition(record.due_date >= new Date().toISOString().slice(0, 10), 422, 'A matured invoice cannot be submitted for financing approval');
     const days = Math.ceil((Date.parse(record.due_date) - Date.parse(record.issue_date)) / 86400000);
     requireCondition(!record.maximum_tenor_days || days <= record.maximum_tenor_days, 422, 'Invoice tenor exceeds the programme maximum');
+    if (p.financing_model === 'early_payment')
+        requireCondition(await enrolled(String(record.programme_id), String(record.supplier_id), db), 409, 'The supplier has not completed enrolment on this programme');
     await validateFieldReferences('invoices', record, actor, db);
 }
 function moduleDefinition(actor: Actor, key: string) { const definition = workflowModules.find(m => m.key === key && m.roles.includes(actor.role)); requireCondition(definition, 403, 'This module is not available to your role'); return definition; }
@@ -107,7 +111,7 @@ async function actionsFor(entity: string, record: Row, actor: Actor, db: DB) {
     if (entity === 'programmes') {
         const dependencies = (await rows('SELECT id FROM invoices WHERE programme_id=$1 AND deleted_at IS NULL LIMIT 1', [record.id], db)).length > 0;
         const economicLock = (await rows("SELECT i.id FROM invoices i LEFT JOIN bids b ON b.invoice_id=i.id AND b.status=1 WHERE i.programme_id=$1 AND (i.status IN ('tender','funded','repaid') OR b.id IS NOT NULL) LIMIT 1", [record.id], db)).length > 0;
-        return { edit: ownerRole(actor) && !record.archived_at && !economicLock && ['draft', 'paused'].includes(record.status ?? 'draft'), delete: ownerRole(actor) && !dependencies && (record.status ?? 'draft') === 'draft' && !record.archived_at, submit: ownerRole(actor) && !record.archived_at && ['draft', 'paused'].includes(record.status ?? 'draft'), activate: actor.role === 'platform_ops' && !record.archived_at && record.status === 'pending_review' && !same(record.created_by, actor.id) && !same(record.last_modified_by, actor.id) && !same(record.configured_by, actor.id), pause: ownerRole(actor) && record.status === 'active', archive: ownerRole(actor) && !record.archived_at, restore: ownerRole(actor) && !!record.archived_at, reason: economicLock ? 'Economic terms are locked by financing activity. Pause the programme to prevent new submissions.' : null };
+        return { edit: actor.role === 'platform_ops' && !record.archived_at && !economicLock && ['draft', 'paused'].includes(record.status ?? 'draft'), delete: actor.role === 'platform_ops' && !dependencies && (record.status ?? 'draft') === 'draft' && !record.archived_at, submit: actor.role === 'platform_ops' && !record.archived_at && ['draft', 'paused'].includes(record.status ?? 'draft'), activate: actor.role === 'platform_ops' && !record.archived_at && record.status === 'pending_review' && !same(record.created_by, actor.id) && !same(record.last_modified_by, actor.id) && !same(record.configured_by, actor.id), pause: actor.role === 'platform_ops' && record.status === 'active', archive: actor.role === 'platform_ops' && !record.archived_at, restore: actor.role === 'platform_ops' && !!record.archived_at, reason: economicLock ? 'Economic terms are locked by financing activity. Pause the programme to prevent new submissions.' : null };
     }
     if (entity === 'bids')
         return { edit: false, delete: actor.role === 'financer' && same(record.financer_id, actor.id) && record.status === 0 && record.portal_state === 'DRAFT', withdraw: actor.role === 'financer' && same(record.financer_id, actor.id) && record.status === 0 && record.portal_state === 'SUBMITTED', reason: 'Edit pricing from the invited opportunity. Accepted offers are retained with their financial history.' };
@@ -353,6 +357,8 @@ export async function managementRequest(actor: Actor, method: string, path: stri
             if (actor.role === 'platform_ops')
                 return await resourceRequest(actor, method, recordId ? ['users', recordId] : ['users'], input);
             requireRole(actor, 'buyer_admin');
+            // SRS A1.3/A4.10: an anchor's users are provisioned by Syndicate from its KYC documentation; anchors cannot add users.
+            requireCondition(recordId, 403, 'Your organisation’s users are set up by INVOX from your onboarding documentation. Contact your relationship manager to add someone.');
             requireCondition(!input.role || input.role === 'buyer_admin', 403, 'Only buyer administrator accounts can be assigned here');
             requireCondition(previous?.role !== 'platform_ops' && previous?.role !== 'financer', 403, 'Cannot manage a privileged account');
             await resourceRequest(actor, 'PATCH', ['buyers', String(actor.buyer_id)], { buyer: { users_attributes: [{ ...input, ...(recordId ? { id: recordId } : {}), role: 'buyer_admin' }] } });
@@ -360,7 +366,7 @@ export async function managementRequest(actor: Actor, method: string, path: stri
             requireCondition(result, 422, 'The user could not be saved');
         }
         else if (entity === 'programmes') {
-            requireCondition(ownerRole(actor), 403, 'Forbidden');
+            requireCondition(actor.role === 'platform_ops', 403, 'Programmes are configured by INVOX operations from the executed programme agreement');
             const target = actor.role === 'platform_ops' ? id.parse(input.buyer_id ?? previous?.buyer_id) : String(actor.buyer_id);
             requireCondition(target && target !== 'null', 422, 'Choose the buyer organisation');
             if (previous)
@@ -369,6 +375,8 @@ export async function managementRequest(actor: Actor, method: string, path: stri
             requireCondition(buyer, 422, 'Buyer is missing or archived');
             rejectManagedFields('programmes', input);
             const data = draftSchema('programmes', !!recordId).extend({ name: z.string().trim().min(2), currency: currencies }).parse({ ...previous, ...withoutBlankRequired('programmes', input) });
+            if (previous && data.financing_model && data.financing_model !== previous.financing_model)
+                requireCondition(!(await rows('SELECT id FROM invoices WHERE programme_id=$1 LIMIT 1', [recordId], db)).length, 409, 'The financing model cannot change once the programme has invoices');
             await validateFieldReferences('programmes', data, actor, db);
             result = await save('programmes', { ...databaseValues('programmes', data), buyer_id: target, configured_by: actor.id, ...(!recordId ? { created_by: actor.id, status: 'draft' } : {}) }, db, recordId);
             await partners(result, input, actor, db);
@@ -509,7 +517,8 @@ async function transition(entity: string, recordId: string, action: string, inpu
         if (['submit', 'activate'].includes(action)) {
             coreSchema('programmes').parse(previous);
             requireCondition(previous.buyer_acceptance_authority !== 'unconfigured' && previous.allocation_policy !== 'unconfigured', 422, 'Configure acceptance authority and allocation policy before release');
-            requireCondition((await rows('SELECT 1 FROM portal_programme_suppliers WHERE programme_id=$1', [recordId], db)).length && (await rows('SELECT 1 FROM portal_programme_financiers WHERE programme_id=$1', [recordId], db)).length, 422, 'Add at least one supplier and financier');
+            const problem = await programmeReleaseProblem(previous, db);
+            requireCondition(!problem, 422, problem ?? '');
             requireCondition(!(await rows("SELECT id FROM conditions_precedent WHERE programme_id=$1 AND mandatory AND status<>'satisfied' LIMIT 1", [recordId], db)).length, 409, 'Satisfy mandatory conditions precedent before release');
         }
         result = await save('programmes', action === 'activate' ? { status: 'active', activated_at: new Date(), released_by: actor.id } : action === 'submit' ? { status: 'pending_review', created_by: actor.id } : action === 'pause' ? { status: 'paused', paused_at: new Date() } : action === 'archive' ? { archived_at: new Date(), archived_by: actor.id, archive_reason: reason } : { archived_at: null, status: 'draft' }, db, recordId);

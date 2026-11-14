@@ -55,6 +55,9 @@ async function gate(actor: Actor, method: string, path: string[]) {
     throw new ApiError(403, 'Operations accounts must enrol and verify an authenticator before using the workspace');
   }
   if (actor.role === 'platform_ops') return;
+  // Read-only people (anchor viewers, funder auditors) can look but never change anything, whatever the screen offers.
+  if (['viewer', 'auditor'].includes(actor.org_role ?? '') && !['GET', 'HEAD'].includes(method) && !['POST portal/notifications', 'PATCH portal/profile'].includes(`${method} ${path.join('/')}`))
+    throw new ApiError(403, 'Your access is read-only');
   // Fail closed: a buyer role with no active buyer membership is never treated as an unrestricted scope.
   const orphaned = actor.role === 'buyer_admin' && !actor.buyer_id;
   if (!orphaned && onboardingPath(method, path)) return;

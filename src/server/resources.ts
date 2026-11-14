@@ -173,6 +173,7 @@ async function buyers(actor: Actor, method: string, buyerId: string | undefined,
     }
     if (method === 'POST' && !buyerId) {
       requireRole(actor, 'platform_ops');
+      throw new ApiError(403, 'Anchors are set up from their executed agreement in Organisation set-up');
       const input = payload(body, 'buyer');
       rejectManagedFields('buyers',input);
       const values=coreSchema('buyers').parse(input);
@@ -221,6 +222,7 @@ async function programmes(actor: Actor, method: string, buyerId: string | undefi
       requireCondition(actor.role === 'platform_ops' || actor.buyer_id, 403, 'No buyer organization is assigned');
       return { data: await rows('SELECT * FROM programmes WHERE ($1::bigint IS NULL OR buyer_id=$1) ORDER BY id', [buyerId ?? (actor.role === 'buyer_admin' ? actor.buyer_id : null)], db) };
     }
+    requireRole(actor, 'platform_ops');
     if (method === 'POST' && !programmeId) {
       const input = payload(body, 'programme');
       const target = buyerId ?? parseId(input.buyer_id);
@@ -460,7 +462,7 @@ async function users(actor: Actor, method: string, userId: string | undefined, b
     if (financerOnly) input.role = 'financer';
     if(!financerOnly)rejectManagedFields('users',input);
     if (method === 'POST' && !userId) {
-      if(financerOnly)rejectManagedFields('financers',input);
+      requireCondition(!financerOnly, 403, 'Funders are set up from their executed agreement in Organisation set-up');
       const profile=financerOnly?fieldSchema('financers',false,{exclude:['email']}).parse(input):null;
       const user=await saveUser(input,actor,db);
       if(profile){await validateFieldReferences('financers',profile,actor,db);await saveFinancierProfile(String(user.id),profile,db);await entityAudit(db,actor,'financers',String(user.id),'created',null,profile);}

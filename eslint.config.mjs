@@ -10,7 +10,7 @@ const compat = new FlatCompat({
 });
 
 const eslintConfig = [
-  { ignores: [".local-backups/**", ".next/**", ".next-smoke/**", "node_modules/**", "next-env.d.ts", "out/**", "coverage/**"] },
+  { ignores: [".local-backups/**", ".next/**", ".next-*/**", "node_modules/**", "next-env.d.ts", "out/**", "coverage/**"] },
   ...compat.extends("next/core-web-vitals", "next/typescript"),
 
   // now override or disable the rules you want

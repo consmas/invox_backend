@@ -106,6 +106,8 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
    await notify(invoice.supplier_user_id,'Invoice awaiting approval',`Invoice ${invoice.invoice_number} needs your review.`,invoice.id,actor,db);
   }else{
    requireRole(actor,'supplier_user','platform_ops');if(actor.role==='platform_ops')requireCondition(typeof body.reason==='string'&&body.reason.trim().length>=10,422,'A reason is required for an administrator decision on behalf of the supplier');requireCondition(invoice.invoice_approval_status==='pending',409,'Invoice is not awaiting your decision');
+   // The supplier's confirmation must come from someone other than the administrator who prepared the invoice for the buyer.
+   const decider=actor.delegation?.admin_id??(actor.role==='platform_ops'?actor.id:null);if(decider)requireCondition(!await preparedOnBehalfBy(decider,'invoices',String(invoice.id),db),403,'You prepared this invoice on behalf of the buyer; the supplier or a different administrator must decide on it');
    const input=z.object({decision:z.enum(['approve','reject','clarify']),reason:z.string().trim().min(5).max(2000).optional()}).parse(body);requireCondition(input.decision==='approve'||input.reason,422,'A reason is required');
    await rows("UPDATE invoices SET invoice_approval_status=$2::varchar,status=CASE WHEN $2::varchar='approved' THEN 'approved' ELSE 'draft' END,supplier_approved_at=CASE WHEN $2::varchar='approved' THEN now() ELSE NULL END,supplier_approved_by=CASE WHEN $2::varchar='approved' THEN $3::bigint ELSE NULL END,rejection_reason=CASE WHEN $2::varchar='rejected' THEN $4 ELSE NULL END,clarification_request=CASE WHEN $2::varchar='clarification' THEN $4 ELSE NULL END,updated_at=now() WHERE id=$1",[invoice.id,{approve:'approved',reject:'rejected',clarify:'clarification'}[input.decision],actor.id,input.reason??null],db);
    body.reason=input.reason;const owners=await rows('SELECT id FROM users WHERE buyer_id=$1',[invoice.buyer_id],db);for(const owner of owners)await notify(owner.id,{approve:'Invoice approved by supplier',reject:'Invoice rejected by supplier',clarify:'Supplier asked for clarification'}[input.decision],`${invoice.invoice_number}: ${{approve:'approved and ready to open for financing.',reject:'rejected',clarify:'clarification requested'}[input.decision]}${input.reason?` — ${input.reason}`:input.decision==='approve'?'':'.'}`,invoice.id,actor,db);
@@ -114,7 +116,7 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
  });
  if(resource==='tenders'&&method==='POST')return transaction(async db=>{
   requireRole(actor,'buyer_admin','platform_ops');
-  const data=z.object({invoice_id:id,requested_amount:money,closes_on:date,financier_ids:z.array(id).min(1).max(100),notes:z.string().max(4000).optional()}).parse(body);
+  const data=z.object({invoice_id:id,requested_amount:money,closes_on:date,financier_ids:z.array(id).min(1).max(100).transform(ids=>[...new Set(ids)]),notes:z.string().max(4000).optional()}).parse(body);
   const invoice=await ownedInvoice(actor,data.invoice_id,db);
   requireCondition(invoice.programme_status==='active'&&!invoice.programme_archived_at,409,'Activate the programme before opening a tender');
   requireCondition(invoice.invoice_approval_status==='approved'&&invoice.status==='approved',409,'Supplier approval is required before opening a tender');
@@ -163,6 +165,7 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
   return transaction(async db=>{
    const [programme]=await rows('SELECT * FROM programmes WHERE id=$1',[data.programme_id],db);requireCondition(programme&&(actor.role==='platform_ops'||same(programme.buyer_id,actor.buyer_id)),403,'Programme is outside your organisation');requireCondition(!programme.archived_at,409,'Programme is archived');
    let [supplier]=await rows('SELECT * FROM suppliers WHERE lower(email)=$1',[data.email],db);
+   requireCondition(!supplier?.archived_at,409,'This supplier is archived; restore it before adding it to a programme');
    let delivery:Row={};
    if(!supplier){
     const token=newToken();const user=await insert('users',{email:data.email,role:1,jti:randomUUID(),encrypted_password:'!invitation-pending',portal_registration:true},db);

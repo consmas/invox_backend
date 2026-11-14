@@ -151,8 +151,17 @@ async function dispatch(req: NextRequest, path: string[]): Promise<NextResponse>
       }
     }
     let res: NextResponse;
-    const acting = await actingActor(req);
-    if (path[0]==='portal' && path[1]==='act-for') res = await actFor(req, path, body);
+    const actForRoute = path[0]==='portal' && path[1]==='act-for';
+    let acting: Actor | null = null;
+    let endActing = false;
+    // A session that is no longer valid (organisation archived, access revoked) must never lock the administrator
+    // out of signing out or of their own workspace: it is ended and the administrator is told why.
+    if (!actForRoute) try { acting = await actingActor(req); } catch (error) {
+      if (!(error instanceof ApiError) || error.status === 401) throw error;
+      if (path[0] !== 'auth') return secureHeaders(setActForCookie(NextResponse.json({ error: `Your session acting for the organisation has ended: ${error.message}`, errors: [error.message], acting_ended: true }, { status: error.status }), null));
+      endActing = true;
+    }
+    if (actForRoute) res = await actFor(req, path, body);
     else if (acting && path[0]==='auth') {
       // Account and credential actions stay with the administrator's own account; the act-for session ends on sign-out.
       if (path[1]==='me' && req.method==='GET') res = NextResponse.json({ user: { id: acting.id, email: acting.email, role: acting.role, buyer_id: acting.buyer_id } });
@@ -170,6 +179,7 @@ async function dispatch(req: NextRequest, path: string[]): Promise<NextResponse>
       const result = await route(actor, req, path, body);
       res = result.status === 204 ? new NextResponse(null,{status:204}) : NextResponse.json(result.data,{status:result.status ?? 200});
     }
+    if (endActing) setActForCookie(res, null);
     return secureHeaders(res);
   } catch (error) {
     let status = 500;

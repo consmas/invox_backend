@@ -7,6 +7,7 @@ import { id, roles, userInput, email, password, bidStatuses } from './validation
 import { appUrl, sendLink, requireMailConfiguration } from './mail';
 import { assertFinancialRelease } from './finance';
 import { audit } from './audit';
+import { preparedOnBehalfBy } from './act-for';
 import { assertFresh } from './context';
 import { cents,discountQuote } from './money';
 import { coreSchema,fieldSchema,fieldCatalog,rejectManagedFields,databaseValues,validateFieldReferences,entityAudit } from './fields';
@@ -115,14 +116,18 @@ async function saveUser(data: Input, actor: Actor, db: DB, userId?: string, buye
   if (normalized.password === '') delete normalized.password;
   const parsed = (previous ? userInput.partial().extend({role:z.enum(roles).optional()}) : userInput).parse(normalized);
   if (parsed.password_confirmation !== undefined && parsed.password) requireCondition(parsed.password === parsed.password_confirmation, 422, 'Passwords do not match');
-  const role = parsed.role ?? roles[previous!.role];
   const targetBuyer = buyerId ?? (parsed.buyer_id !== undefined ? parsed.buyer_id : previous?.buyer_id ?? null);
+  // userInput defaults the role to supplier_user; a buyer member without an explicit role is a buyer administrator.
+  const requested = normalized.role === undefined || normalized.role === '' ? undefined : parsed.role;
+  const role = requested ?? (targetBuyer ? 'buyer_admin' : previous ? roles[previous.role] : parsed.role ?? 'supplier_user');
   if (actor.role !== 'platform_ops') {
     requireRole(actor, 'buyer_admin');
     ownBuyer(actor, buyerId);
     requireCondition(['buyer_admin', 'supplier_user'].includes(role), 403, 'Cannot assign a privileged role');
     if (previous) requireCondition(same(previous.buyer_id, buyerId) && previous.role !== 2 && previous.role !== 3, 403, 'Forbidden');
   }
+  // A supplier account is linked through its supplier profile, never through a buyer membership.
+  requireCondition(!targetBuyer || role === 'buyer_admin', 422, 'Members of a buyer organisation must be buyer administrators');
   if (targetBuyer) found((await rows('SELECT id FROM buyers WHERE id=$1', [targetBuyer], db))[0]);
   if (previous && same(previous.id, actor.id)) requireCondition(role === actor.role, 422, 'You cannot change your own role');
   // Protect the last operations account against lockout, including concurrent demotions (F07).
@@ -365,6 +370,9 @@ async function bids(actor: Actor, method: string, invoiceId: string | undefined,
       requireCondition(method === 'PATCH' || method === 'PUT', 405, 'Method not allowed');
       ownBuyer(actor, bid.buyer_id);
       requireCondition(action === 'accept' || action === 'reject', 404, 'Not found');
+      // The person deciding for the buyer must not be the one who priced the offer for the financier.
+      const decider = actor.delegation?.admin_id ?? actor.id;
+      requireCondition(!await preparedOnBehalfBy(decider, 'bids', bidId, db) && !(await rows("SELECT 1 FROM portal_events WHERE actor_id=$1 AND event LIKE 'bid.%' AND details->>'bid_id'=$2 UNION ALL SELECT 1 FROM audit_events WHERE actor_id=$1 AND record_type='bid' AND record_id::text=$2 AND event<>'bid.rejected' LIMIT 1", [decider, bidId], db)).length, 403, 'You prepared this offer on behalf of the financier; the buyer or a different administrator must decide on it');
       if (action === 'accept') {
         requireCondition(bid.portal_state!=='DRAFT'&&bid.portal_state!=='WITHDRAWN',409,'Only submitted offers can be accepted');
         assertFinancialRelease();
@@ -551,7 +559,7 @@ async function suppliers(actor: Actor, method: string, supplierId: string | unde
       rejectManagedFields('suppliers',raw);
       const data=fieldSchema('suppliers',true).parse({...raw,contact_email:raw.contact_email??raw.email});
       const { contact_email, ...attrs } = data;
-      if (contact_email) {
+      if (contact_email && previous.user_id) {
         await update('users', String(previous.user_id), { email: contact_email }, db);
         await revokeSessions(String(previous.user_id), db);
       }

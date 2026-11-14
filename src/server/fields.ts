@@ -76,6 +76,18 @@ export function databaseValues(entity:string,data:Record<string,unknown>){
   }
   return result;
 }
+/**
+ * A document may be referenced by operations, by whoever uploaded it (or had it uploaded on their behalf), or by
+ * the organisation it belongs to. Two missing organisation ids never count as a match.
+ */
+async function documentInScope(record:Row,actor:Actor,db:DB){
+  if(actor.role==='platform_ops')return true;
+  const mine=(value:unknown)=>value!=null&&String(value)===actor.id;
+  if(mine(record.uploaded_by)||mine(record.on_behalf_of_user_id))return true;
+  if(actor.role==='buyer_admin')return !!actor.buyer_id&&record.buyer_id!=null&&String(record.buyer_id)===String(actor.buyer_id);
+  if(actor.role==='supplier_user'&&record.supplier_id!=null)return (await rows('SELECT 1 FROM suppliers WHERE id=$1 AND user_id=$2',[record.supplier_id,actor.id],db)).length>0;
+  return false;
+}
 export async function validateFieldReferences(entity:string,data:Record<string,unknown>,actor:Actor,db:DB){
   const related:Record<string,Row>={};
   for(const field of fieldCatalog[entity].fields){
@@ -85,13 +97,13 @@ export async function validateFieldReferences(entity:string,data:Record<string,u
       const [record]=await rows(`SELECT * FROM "${target}" WHERE id=$1${field.reference==='financers'?' AND role=3':''}`,[data[field.key]],db);
       requireCondition(record,422,`${field.label} does not exist`);
       related[field.key]=record;
-      if(target==='documents'&&actor.role!=='platform_ops')requireCondition(String(record.buyer_id)===String(actor.buyer_id),403,'Document is outside your organisation');
+      if(target==='documents')requireCondition(await documentInScope(record,actor,db),403,'Document is outside your organisation');
     }
     if(field.type==='document_array'&&Array.isArray(data[field.key])){
       for(const reference of data[field.key] as {document_id:string}[]){
-        const [record]=await rows('SELECT buyer_id FROM documents WHERE id=$1',[reference.document_id],db);
+        const [record]=await rows('SELECT buyer_id,supplier_id,uploaded_by,on_behalf_of_user_id FROM documents WHERE id=$1',[reference.document_id],db);
         requireCondition(record,422,'Supporting document does not exist');
-        if(actor.role!=='platform_ops')requireCondition(String(record.buyer_id)===String(actor.buyer_id),403,'Supporting document is outside your organisation');
+        requireCondition(await documentInScope(record,actor,db),403,'Supporting document is outside your organisation');
       }
     }
   }

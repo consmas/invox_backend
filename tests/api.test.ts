@@ -631,3 +631,9 @@ test('portal invoice form payload creates, edits, deletes and submits drafts wit
   assert.equal(locked.data._actions.edit,false);assert.equal(locked.data._actions.delete,false);
   assert.equal((await request('DELETE',`portal/manage/invoices/${draft.data.id}`,undefined,tokens.buyerAdmin)).status,409);
 });
+test('buyer members default to buyer administrators and can never be supplier accounts',async()=>{
+  const added=await request('PATCH',`buyers/${fixture.buyer.id}`,{buyer:{users_attributes:[{email:'Default.Role@Example.test',password:'new-password-123'}]}},tokens.ops);
+  assert.equal(added.status,200,JSON.stringify(added.data));
+  assert.equal(added.data.users.find((u:any)=>u.email==='default.role@example.test')?.role,'buyer_admin');
+  assert.equal((await request('PATCH',`buyers/${fixture.buyer.id}`,{buyer:{users_attributes:[{email:'supplier.member@example.test',password:'new-password-123',role:'supplier_user'}]}},tokens.ops)).status,422);
+});

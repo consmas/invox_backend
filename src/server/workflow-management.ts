@@ -191,7 +191,7 @@ async function listRecords(entity: string, actor: Actor, db: DB, recordId?: stri
                 records = records.map(r => ({ ...r, id: r.invoice_id }));
         }
         else if (entity === 'bids')
-            records = await rows('SELECT b.*,t.id AS tender_id FROM bids b LEFT JOIN financing_tenders t ON t.invoice_id=b.invoice_id WHERE $1 OR b.financer_id=$2 ORDER BY b.id DESC', [actor.role === 'platform_ops', actor.id], db);
+            records = await rows('SELECT b.*,(SELECT t.id FROM financing_tenders t WHERE t.invoice_id=b.invoice_id ORDER BY t.id DESC LIMIT 1) AS tender_id FROM bids b WHERE $1 OR b.financer_id=$2 ORDER BY b.id DESC', [actor.role === 'platform_ops', actor.id], db);
         else if (entity === 'ledger')
             records = await rows("SELECT j.*,coalesce((SELECT jsonb_agg(jsonb_build_object('account',l.account_code,'side',l.side,'amount',l.amount)) FROM ledger_lines l WHERE l.journal_id=j.id),'[]'::jsonb) AS lines FROM ledger_journals j ORDER BY j.id DESC LIMIT 250", [], db);
         else if (entity === 'tenders')
@@ -356,7 +356,8 @@ export async function managementRequest(actor: Actor, method: string, path: stri
             requireCondition(!input.role || input.role === 'buyer_admin', 403, 'Only buyer administrator accounts can be assigned here');
             requireCondition(previous?.role !== 'platform_ops' && previous?.role !== 'financer', 403, 'Cannot manage a privileged account');
             await resourceRequest(actor, 'PATCH', ['buyers', String(actor.buyer_id)], { buyer: { users_attributes: [{ ...input, ...(recordId ? { id: recordId } : {}), role: 'buyer_admin' }] } });
-            result = (await rows('SELECT id,email,name,role,buyer_id,created_at,updated_at FROM users WHERE buyer_id=$1 AND email=$2', [actor.buyer_id, input.email ?? previous?.email], db))[0];
+            result = (await rows('SELECT id,email,name,role,buyer_id,created_at,updated_at FROM users WHERE buyer_id=$1 AND lower(email)=lower($2)', [actor.buyer_id, String(input.email ?? previous?.email ?? '').trim()], db))[0];
+            requireCondition(result, 422, 'The user could not be saved');
         }
         else if (entity === 'programmes') {
             requireCondition(ownerRole(actor), 403, 'Forbidden');

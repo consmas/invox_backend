@@ -101,7 +101,9 @@ async function load(provider: Provider, db?: DB, lock = false): Promise<Row> {
 export async function activeIntegration(provider: Provider, db?: DB): Promise<{ mode: string; config: Row; secrets: Record<string, string> } | null> {
   const row = await load(provider, db).catch(() => null);
   if (!row?.enabled) return null;
-  return { mode: row.mode, config: row.config, secrets: unseal(row.secrets_sealed) };
+  // A missing or rotated encryption key must not stop every email: callers fall back to the environment settings.
+  try { return { mode: row.mode, config: row.config, secrets: unseal(row.secrets_sealed) }; }
+  catch (error) { console.error(`Stored ${provider} credentials could not be decrypted`, (error as Error).message); return null; }
 }
 function view(row: Row, canEdit: boolean) {
   const definition = definitions[row.provider as Provider];

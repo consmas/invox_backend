@@ -13,6 +13,7 @@ import { handleRequest } from '../src/server/http';
 import { pool, rows, insert, transaction } from '../src/server/db';
 import { POST as uploadDocument } from '../src/app/api/portal/documents/route';
 import { preparedOnBehalfBy } from '../src/server/act-for';
+import { validateFieldReferences } from '../src/server/fields';
 
 const connection = process.env.TEST_DATABASE_URL;
 if (!connection || !new URL(connection).pathname.endsWith('_test')) throw new Error('Set TEST_DATABASE_URL to an isolated PostgreSQL database ending in _test.');
@@ -240,4 +241,36 @@ test('the super administrator onboards a brand-new organisation end to end; its 
   const session = await request('GET', 'portal/session', undefined, own);
   assert.equal(session.data.actor.role, 'buyer_admin');
   assert.equal(session.data.needs_onboarding, false);
+});
+
+test('acting for a supplier names the supplier organisation, not its representative', async () => {
+  const started = await startActing(`supplier-${fx.supplier.id}`);
+  assert.equal(started.status, 201, JSON.stringify(started.data));
+  assert.equal(started.data.name, 'Supplier');
+  const session = await request('GET', 'portal/session', undefined, tokens.superAdmin, started.cookie);
+  assert.equal(session.data.acting.name, 'Supplier');
+});
+
+test('an act-for session that is no longer valid ends instead of locking the administrator out', async () => {
+  const started = await startActing(`supplier-${fx.supplier.id}`);
+  await rows('UPDATE suppliers SET archived_at=now() WHERE id=$1', [fx.supplier.id]);
+  try {
+    const blocked = await request('GET', 'portal/session', undefined, tokens.superAdmin, started.cookie);
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.data.acting_ended, true);
+    assert.match(blocked.headers.get('set-cookie') ?? '', /invox_act_for=;/);
+    // Account actions keep working and drop the stale session.
+    const me = await request('GET', 'auth/me', undefined, tokens.superAdmin, started.cookie);
+    assert.equal(me.status, 200);
+    assert.equal(me.data.user.role, 'platform_ops');
+    assert.match(me.headers.get('set-cookie') ?? '', /invox_act_for=;/);
+  } finally { await rows('UPDATE suppliers SET archived_at=NULL WHERE id=$1', [fx.supplier.id]); }
+});
+
+test('documents can only be referenced by their own organisation (missing organisations never match)', async () => {
+  const supplierActor = { id: String(fx.supplierUser.id), email: fx.supplierUser.email, role: 'supplier_user' as const, buyer_id: null };
+  const [foreign] = await rows("INSERT INTO documents(file_name,mime_type,size_bytes,storage_key,sha256,uploaded_by,upload_status,scan_status,created_by,category) VALUES('lender.pdf','application/pdf',1,$1,$2,$3,'stored','pending',$3,'other') RETURNING id", [randomUUID(), 'a'.repeat(64), fx.financer.id]);
+  const [own] = await rows("INSERT INTO documents(supplier_id,file_name,mime_type,size_bytes,storage_key,sha256,uploaded_by,upload_status,scan_status,created_by,category) VALUES($1,'mine.pdf','application/pdf',1,$2,$3,$4,'stored','pending',$4,'other') RETURNING id", [fx.supplier.id, randomUUID(), 'b'.repeat(64), fx.superAdmin.id]);
+  await assert.rejects(transaction(db => validateFieldReferences('invoices', { supporting_documents: [{ document_id: String(foreign.id) }] }, supplierActor, db)), /outside your organisation/);
+  await transaction(db => validateFieldReferences('invoices', { supporting_documents: [{ document_id: String(own.id) }] }, supplierActor, db));
 });

@@ -68,11 +68,12 @@ export async function resolveTarget(target: string, db?: DB, starting = false): 
     return { account: pick(users), name: buyer.name, recipients: users.map(u => String(u.id)), home: '/buyer' };
   }
   if (kind === 'supplier') {
-    const [supplier] = await rows('SELECT s.name,s.archived_at,u.* FROM suppliers s LEFT JOIN users u ON u.id=s.user_id AND u.disabled_at IS NULL WHERE s.id=$1', [key], db);
+    // Aliased: users.name would otherwise overwrite the supplier's name in the row.
+    const [supplier] = await rows('SELECT s.name AS org_name,s.archived_at,u.* FROM suppliers s LEFT JOIN users u ON u.id=s.user_id AND u.disabled_at IS NULL WHERE s.id=$1', [key], db);
     requireCondition(supplier, 404, 'Organisation not found');
     requireCondition(!supplier.archived_at, 409, 'Restore the organisation before acting for it');
     requireCondition(supplier.id, 409, 'Add an active user to this organisation before acting for it');
-    return { account: supplier, name: supplier.name, recipients: [String(supplier.id)], home: '/supplier' };
+    return { account: supplier, name: supplier.org_name, recipients: [String(supplier.id)], home: '/supplier' };
   }
   if (kind === 'financier') {
     const [financier] = await rows('SELECT f.name AS org_name,f.archived_at,u.* FROM financier_profiles f JOIN users u ON u.id=f.user_id WHERE f.user_id=$1 AND u.role=3', [key], db);
@@ -109,8 +110,9 @@ export const responsibleId = (actor: Actor) => actor.delegation?.admin_id ?? act
  */
 export async function preparedOnBehalfBy(adminId: string, recordType: string, recordId: string, db?: DB) {
   const singular = recordType.replace(/s$/, '');
+  // Invoice events carry the invoice in their own column rather than in the details.
   const portal = await rows(`SELECT 1 FROM portal_events WHERE acting_admin_id=$1 AND (event LIKE $2 OR event LIKE $3)
-    AND (details->>'record_id'=$4 OR details->>$5=$4 OR details->>'org_ref'=$4) LIMIT 1`, [adminId, `${recordType}.%`, `${singular}.%`, recordId, `${singular}_id`], db);
+    AND (details->>'record_id'=$4 OR details->>$5=$4 OR details->>'org_ref'=$4 OR ($6 AND invoice_id::text=$4)) LIMIT 1`, [adminId, `${recordType}.%`, `${singular}.%`, recordId, `${singular}_id`, singular === 'invoice'], db);
   if (portal.length) return true;
   return (await rows('SELECT 1 FROM audit_events WHERE acting_admin_id=$1 AND record_type=$2 AND record_id::text=$3 LIMIT 1', [adminId, singular, recordId], db)).length > 0;
 }

@@ -496,3 +496,16 @@ test('S1.3/NFR-SEC-002: invited people must enrol a second factor; the audit tra
     assert.equal(event.ip, '196.200.10.7');
   } finally { delete process.env.CLIENT_IP_HEADER; }
 });
+
+test('F1.8: a funder that has not passed compliance cannot be attached to a programme', async () => {
+  const unverified = (await rows("SELECT split_part(org_ref,'-',2) AS id FROM organisation_lifecycle WHERE counterparty='FUNDER' AND status='SETUP_IN_PROGRESS' LIMIT 1"))[0].id;
+  const programme = await request('POST', 'portal/manage/programmes', { name: 'Funder gate', buyer_id: fx.liveBuyer.id, limit: '1000.00', fee_percent: '0', maturity_days: 30, currency: 'GHS', programme_reference: 'PRG-GATE', governing_law: 'Ghana', jurisdiction: 'Accra', financing_model: 'tender', financier_ids: [unverified] }, tokens.ops);
+  assert.equal(programme.status, 409);
+  assert.match(programme.data.error, /after its compliance sign-off/);
+});
+
+test('An anchor or funder still in set-up cannot be acted for (it has no platform access yet)', async () => {
+  const res = await request('POST', 'portal/act-for', { target: fx.anchorRef, reason: 'Loading records for the customer' }, tokens.ops);
+  assert.equal(res.status, 409);
+  assert.match(res.data.error, /still being set up/);
+});

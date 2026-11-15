@@ -9,7 +9,7 @@ import { resourceRequest, invoiceList, lockOperatorSet } from './resources';
 import { assertFresh } from './context';
 import { portalEvent, notify } from './portal-support';
 import { preparedOnBehalfBy } from './act-for';
-import { programmeReleaseProblem } from './onboarding/programme';
+import { funderCleared, programmeReleaseProblem } from './onboarding/programme';
 import { enrolled } from './onboarding/supplier';
 import { cents } from './money';
 type Module = {
@@ -240,6 +240,8 @@ async function partners(record: Row, data: Row, actor: Actor, db: DB) {
     }
     if (data.financier_ids !== undefined) {
         const ids = z.array(id).max(250).parse(data.financier_ids);
+        for (const financer of ids)
+            requireCondition(await funderCleared(financer, db), 409, 'A funder can join a programme only after its compliance sign-off');
         for (const financer of ids)
             requireCondition((await rows('SELECT u.id FROM users u JOIN financier_profiles f ON f.user_id=u.id WHERE u.id=$1 AND u.role=3 AND u.disabled_at IS NULL AND f.archived_at IS NULL', [financer], db)).length, 422, 'Financier is missing or archived');
         const old = await rows('SELECT financer_id FROM portal_programme_financiers WHERE programme_id=$1', [record.id], db);

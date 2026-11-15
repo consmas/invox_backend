@@ -58,6 +58,11 @@ type Target = { account: Row; name: string; recipients: string[]; home: string }
 /** Resolves the organisation's acting account: its earliest active user (an invited user counts as active). */
 export async function resolveTarget(target: string, db?: DB, starting = false): Promise<Target> {
   const [kind, key] = target.split('-');
+  // SRS §13.5.1/§13.7.1: an anchor or funder in set-up has no platform access, so nobody may act for it either.
+  if (kind === 'buyer' || kind === 'financier') {
+    const [state] = await rows('SELECT status,legacy FROM organisation_lifecycle WHERE org_ref=$1', [target], db);
+    requireCondition(!state || state.legacy || state.status === 'ACTIVE', 409, 'This organisation is still being set up; it can be acted for once it is active');
+  }
   const pick = (users: Row[]) => users.find(u => !String(u.encrypted_password ?? '').startsWith('!')) ?? users[0];
   if (kind === 'buyer') {
     const [buyer] = await rows('SELECT id,name,archived_at FROM buyers WHERE id=$1', [key], db);

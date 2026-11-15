@@ -1,6 +1,11 @@
 import { rows, type DB, type Row } from '../db';
 import { lifecycle } from './lifecycle';
 
+/** F1.8: a funder takes part in nothing until compliance has signed it off (funders live before the checklist are unaffected). */
+export async function funderCleared(financerId: string, db: DB) {
+  const [state] = await rows('SELECT status,legacy FROM organisation_lifecycle WHERE org_ref=$1', [`financier-${financerId}`], db);
+  return !state || state.legacy || ['VERIFIED', 'ACTIVE'].includes(state.status);
+}
 /**
  * Release (A4.8) checks that exist so far. A new anchor can only have programmes released once its compliance file is
  * signed off (VERIFIED or later). Early-payment programmes additionally need funding facilities, which arrive with the

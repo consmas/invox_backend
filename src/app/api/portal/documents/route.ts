@@ -18,6 +18,19 @@ const DAILY_FILES=Number(process.env.DOCUMENT_DAILY_LIMIT)||100;
 const CONCURRENT=Math.max(1,Number(process.env.DOCUMENT_UPLOAD_CONCURRENCY)||4);
 let active=0;
 
+const MIN_IMAGE_SIDE=Number(process.env.DOCUMENT_MIN_IMAGE_PX)||600;
+/** Pixel dimensions from the PNG header or the JPEG start-of-frame marker; null when they cannot be read. */
+function imageSize(buffer:Buffer,png:boolean):{width:number;height:number}|null{
+ if(png)return buffer.length>=24?{width:buffer.readUInt32BE(16),height:buffer.readUInt32BE(20)}:null;
+ let offset=2;
+ while(offset+9<buffer.length){
+  if(buffer[offset]!==0xff){offset++;continue;}
+  const marker=buffer[offset+1];const length=buffer.readUInt16BE(offset+2);
+  if(marker>=0xc0&&marker<=0xcf&&![0xc4,0xc8,0xcc].includes(marker))return {height:buffer.readUInt16BE(offset+5),width:buffer.readUInt16BE(offset+7)};
+  offset+=2+length;
+ }
+ return null;
+}
 function fail(status:number,error:string){return secureHeaders(NextResponse.json({error},{status}));}
 export function POST(req:NextRequest){return withRequest(req,()=>upload(req));}
 async function upload(req:NextRequest){
@@ -38,6 +51,9 @@ async function upload(req:NextRequest){
   if(!(file instanceof File)||file.size<1||file.size>MAX_FILE)return fail(422,'Choose a file up to 10 MB');
   const buffer=Buffer.from(await file.arrayBuffer());const magic=buffer.subarray(0,8);const pdf=buffer.subarray(0,5).toString()==='%PDF-';const png=magic.toString('hex')==='89504e470d0a1a0a';const jpeg=magic[0]===255&&magic[1]===216&&magic[2]===255;
   if(!pdf&&!png&&!jpeg)return fail(422,'Upload a PDF, PNG or JPEG document');
+  // S2.2: a photographed document must be readable; refuse it now with corrective advice rather than failing in review later.
+  const size=png||jpeg?imageSize(buffer,png):null;
+  if(size&&Math.min(size.width,size.height)<MIN_IMAGE_SIDE)return fail(422,`This photo is too small to read (${size.width}×${size.height} pixels). Take it again closer, in good light, with the whole page in view.`);
   const [usage]=await rows("SELECT coalesce(sum(size_bytes),0)::bigint AS bytes,count(*) FILTER (WHERE created_at>now()-interval '1 day')::int AS today FROM documents WHERE (uploaded_by=$1 OR on_behalf_of_user_id=$1) AND archived_at IS NULL",[actor.id]);
   if(Number(usage.bytes)+file.size>QUOTA)return fail(413,'Your document storage allowance is full. Archive unused documents or contact operations.');
   if(Number(usage.today)>=DAILY_FILES)return fail(429,'Daily upload limit reached. Try again tomorrow.');

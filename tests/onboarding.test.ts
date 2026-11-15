@@ -198,7 +198,7 @@ test('S1: an anchor invites suppliers by email or phone; existing suppliers are 
   const token = new URL(byEmail.data.preview_url).searchParams.get('token')!;
   const info = (await request('GET', `auth/invite?token=${token}`)).data;
   assert.deepEqual([info.anchor, info.programme, info.email, info.registration_number], ['Harbour Retail', 'Harbour suppliers', 'ar@volta.test', 'VP-9']);
-  const supplierRef = `supplier-${byEmail.data.id}`;
+  const supplierRef = `supplier-${byEmail.data.id}`; fx.voltaRef = supplierRef;
   assert.equal((await rows('SELECT status FROM organisation_lifecycle WHERE org_ref=$1', [supplierRef]))[0].status, 'INVITED');
   assert.equal((await rows('SELECT status,channel FROM programme_enrolments WHERE supplier_id=$1', [byEmail.data.id]))[0].status, 'PENDING_ENROLMENT');
 
@@ -226,11 +226,182 @@ test('S1: an anchor invites suppliers by email or phone; existing suppliers are 
   assert.deepEqual([byPhone.data.delivery.channel, byPhone.data.delivery.sent], ['sms', false]);
   assert.match(byPhone.data.warning, /SMS could not be sent/);
   assert.equal((await rows('SELECT delivery_status FROM programme_enrolments WHERE supplier_id=$1', [byPhone.data.id]))[0].delivery_status, 'failed');
-  const phoneToken = new URL(byPhone.data.preview_url).searchParams.get('token')!;
+  const phoneToken = new URL(byPhone.data.preview_url).searchParams.get('token')!; fx.temaRef = `supplier-${byPhone.data.id}`;
   assert.equal((await request('POST', 'auth/signup', { email: 'owner@temafresh.test', password: 'Supplier-password-2', role: 'supplier_user', invite_token: phoneToken })).status, 201, 'any email when invited by phone');
   assert.equal((await rows('SELECT email FROM suppliers WHERE id=$1', [byPhone.data.id]))[0].email, 'owner@temafresh.test');
 
   // Released programmes only.
   const draft = (await rows("INSERT INTO programmes(buyer_id,name,\"limit\",fee_percent,maturity_days,currency,status) VALUES($1,'Draft',1000,0,30,'GHS','draft') RETURNING id", [fx.liveBuyer.id]))[0];
   assert.equal((await request('POST', 'portal/suppliers', { name: 'Early Bird', email: 'early@bird.test', programme_id: draft.id }, tokens.anchorAdmin)).status, 409);
+});
+
+// ── increment 2: the compliance gate (A2, F1.7–F1.8, S2) ─────────────────────
+async function uploadImage(token: string, width: number, height: number) {
+  const png = Buffer.alloc(64); Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(png); png.writeUInt32BE(13, 8); png.write('IHDR', 12); png.writeUInt32BE(width, 16); png.writeUInt32BE(height, 20);
+  const form = new FormData(); form.set('file', new File([png, randomUUID()], 'photo.png', { type: 'image/png' })); form.set('category', 'photo');
+  const res = await uploadDocument(new NextRequest('http://localhost:3000/api/portal/documents', { method: 'POST', headers: { cookie: `invoix_token=${token}` }, body: form }));
+  return { status: res.status, data: await res.json() };
+}
+const inDays = (days: number) => new Date(Date.now() + days * 86400000).toISOString().slice(0, 10);
+async function fileChecklist(ref: string, token: string) {
+  const file = (await request('GET', `portal/compliance/${ref}`, undefined, token)).data;
+  for (const item of file.checklist.filter((i: any) => i.state !== 'filed'))
+    assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: item.key, document_id: await upload(token), issued_on: today, expires_on: item.expires ? inDays(365) : undefined }, token)).status, 201, item.key);
+}
+async function screenAll(ref: string, token: string, except?: string) {
+  const file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  for (const subject of file.screening.filter((s: any) => s.state === 'not_screened'))
+    assert.equal((await request('POST', `portal/compliance/${ref}/screening`, { subject_type: subject.type, subject_name: subject.name, outcome: subject.name === except ? 'potential_match' : 'clear', reference: 'MANUAL-SCREEN-1' }, token)).status, 201);
+}
+
+test('A2: the anchor compliance file is complete, screened and independently signed off before it is verified', async () => {
+  const ref = fx.anchorRef;
+  let file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  assert.ok(file.checklist.length >= 5);
+  assert.ok(file.submission_problems.some((p: string) => p.startsWith('File the certificate of incorporation')));
+  assert.equal((await request('GET', `portal/compliance/${ref}`, undefined, tokens.anchorAdmin)).status, 403, 'the anchor has no access during set-up');
+  assert.equal((await request('POST', `portal/compliance/${ref}/submit`, {}, tokens.ops)).status, 422);
+
+  // Documents: an expiring item needs a future expiry date.
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'registered_address', document_id: await upload(tokens.ops) }, tokens.ops)).status, 422);
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'registered_address', document_id: await upload(tokens.ops), expires_on: '2001-01-01' }, tokens.ops)).status, 422);
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'not_on_the_list', document_id: await upload(tokens.ops) }, tokens.ops)).status, 422);
+  await fileChecklist(ref, tokens.ops);
+
+  // Ownership must resolve to natural persons above the threshold, with at least one director.
+  const holding = await request('POST', `portal/compliance/${ref}/owners`, { kind: 'entity', name: 'Acme Group Holdings', ownership_percent: 60 }, tokens.ops);
+  assert.equal(holding.status, 201);
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  assert.ok(file.submission_problems.some((p: string) => p.includes('Acme Group Holdings holds 60.0%')));
+  assert.ok(file.submission_problems.includes('Record at least one director'));
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Ama Owner', nationality: 'GH', ownership_percent: 100, parent_id: holding.data.id }, tokens.ops)).status, 201);
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'entity', name: 'Bad', is_director: true }, tokens.ops)).status, 422);
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Kwesi Director', is_director: true }, tokens.ops)).status, 201);
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  assert.equal(file.owners.find((o: any) => o.name === 'Ama Owner').effective_percent, 60);
+
+  // Settlement account with evidence; a malformed number is refused.
+  const evidence = await upload(tokens.ops);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'GCB Bank', account_number: '12', account_name: 'ACME Holdings Ltd', evidence_document_id: evidence }, tokens.ops)).status, 422);
+  const account = await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'GCB Bank', bank_code: '040100', account_number: '1011 2233 4455', account_name: 'ACME Holdings Ltd', evidence_document_id: evidence, name_check: 'match' }, tokens.ops);
+  assert.equal(account.status, 201, JSON.stringify(account.data));
+
+  // Screening: every party, a potential match opens a task and blocks submission until a different person resolves it.
+  await screenAll(ref, tokens.ops, 'Kwesi Director');
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  assert.deepEqual(file.screening.map((s: any) => s.type).sort(), ['individual', 'individual', 'organisation', 'signatory']);
+  assert.ok(file.submission_problems.includes('Resolve the potential screening match for Kwesi Director'));
+  assert.equal((await rows("SELECT count(*)::int AS n FROM portal_exceptions WHERE org_ref=$1 AND kind='COMPLIANCE_REVIEW'", [ref]))[0].n, 1);
+  const hit = file.screening.find((s: any) => s.state === 'potential_match').latest;
+  assert.equal((await request('POST', `portal/compliance/${ref}/screening/${hit.id}/resolve`, { resolution: 'false_positive', note: 'Different date of birth and nationality' }, tokens.ops)).status, 403, 'not the recorder');
+  assert.equal((await request('POST', `portal/compliance/${ref}/screening/${hit.id}/resolve`, { resolution: 'false_positive', note: 'Different date of birth and nationality' }, tokens.checker)).status, 200);
+
+  // Submit → compliance review; the file locks.
+  const submitted = await request('POST', `portal/compliance/${ref}/submit`, {}, tokens.ops);
+  assert.equal(submitted.status, 200, JSON.stringify(submitted.data));
+  assert.equal(submitted.data.status, 'COMPLIANCE_REVIEW');
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Late', is_director: true }, tokens.ops)).status, 409);
+
+  // The submitter cannot decide; sign-off needs the verified account; the recorder cannot verify the account.
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'sign_off', risk_rating: 'medium' }, tokens.ops)).status, 403);
+  const early = await request('POST', `portal/compliance/${ref}/decide`, { decision: 'sign_off', risk_rating: 'medium' }, tokens.checker);
+  assert.equal(early.status, 422);
+  assert.match(early.data.error, /Verify the account the anchor settles/);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${account.data.id}/verify`, { decision: 'verify' }, tokens.ops)).status, 403);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${account.data.id}/verify`, { decision: 'verify' }, tokens.checker)).status, 200);
+  const [verifiedAccount] = await rows('SELECT status,usable_from > now() AS cooling FROM settlement_accounts WHERE id=$1', [account.data.id]);
+  assert.deepEqual([verifiedAccount.status, verifiedAccount.cooling], ['VERIFIED', true]);
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'sign_off' }, tokens.checker)).status, 422, 'risk rating required');
+  const signed = await request('POST', `portal/compliance/${ref}/decide`, { decision: 'sign_off', risk_rating: 'medium' }, tokens.checker);
+  assert.equal(signed.status, 200, JSON.stringify(signed.data));
+  const [state] = await rows("SELECT status,risk_rating,re_verification_due::text AS due FROM organisation_lifecycle WHERE org_ref=$1", [ref]);
+  assert.deepEqual([state.status, state.risk_rating], ['VERIFIED', 'medium']);
+  assert.ok(state.due > inDays(700) && state.due < inDays(740), state.due);
+  assert.equal((await rows('SELECT status FROM portal_org_reviews WHERE org_ref=$1', [ref]))[0].status, 'APPROVED');
+  const history = (await request('GET', `portal/setup/${ref}`, undefined, tokens.ops)).data.history.map((h: any) => h.new_status);
+  assert.deepEqual(history.slice(-2), ['COMPLIANCE_REVIEW', 'VERIFIED']);
+
+  // A later bank-account change needs a recorded signatory and supersedes the old account once verified.
+  const evidence2 = await upload(tokens.ops);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Stanbic', account_number: '9040001112223', account_name: 'ACME Holdings Ltd', evidence_document_id: evidence2 }, tokens.ops)).status, 422);
+  const [signatory] = await rows('SELECT id FROM authorised_signatories WHERE org_ref=$1', [ref]);
+  const change = await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Stanbic', account_number: '9040001112223', account_name: 'ACME Holdings Ltd', evidence_document_id: evidence2, authorised_by_signatory_id: signatory.id }, tokens.ops);
+  assert.equal(change.status, 201, JSON.stringify(change.data));
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${change.data.id}/verify`, { decision: 'verify' }, tokens.checker)).status, 200);
+  assert.deepEqual((await rows('SELECT status FROM settlement_accounts WHERE org_ref=$1 ORDER BY id', [ref])).map(a => a.status), ['SUPERSEDED', 'VERIFIED']);
+});
+
+test('S2: a supplier verifies itself from a phone, is referred back with itemised gaps, then signed off', async () => {
+  const ref = fx.voltaRef;
+  const supplier = await login('ar@volta.test', 'Supplier-password-1');
+  assert.equal((await request('GET', `portal/compliance/${fx.anchorRef}`, undefined, supplier)).status, 403, 'only its own file');
+  let file = (await request('GET', `portal/compliance/${ref}`, undefined, supplier)).data;
+  assert.equal(file.tier, 'simplified');
+  assert.equal(file.screening, undefined, 'screening detail is internal');
+  assert.deepEqual(file.checklist.map((i: any) => i.key), ['incorporation', 'individual_ids']);
+
+  // Photos are checked for legibility at upload.
+  const blurry = await uploadImage(supplier, 320, 240);
+  assert.equal(blurry.status, 422);
+  assert.match(blurry.data.error, /too small to read/);
+  const photo = await uploadImage(supplier, 1600, 1200);
+  assert.equal(photo.status, 201, JSON.stringify(photo.data));
+
+  // Company details confirmed by the supplier; never a duplicate of an existing organisation.
+  assert.equal((await request('PATCH', `portal/compliance/${ref}/profile`, { registration_number: 'acme', country: 'GH' }, supplier)).status, 409);
+  assert.equal((await request('PATCH', `portal/compliance/${ref}/profile`, { legal_name: 'Volta Packaging Limited', registered_address: '4 Harbour Road, Tema', tax_id: 'P0012345678' }, supplier)).status, 200);
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'incorporation', document_id: photo.data.id }, supplier)).status, 201);
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Efua Owusu', nationality: 'GH', ownership_percent: 100, is_director: true }, supplier)).status, 201);
+  // Bank account: self-service at first onboarding; a name that differs from the legal entity is flagged for review.
+  const account = await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Ecobank', account_number: '1441000123456', account_name: 'Efua Owusu', evidence_document_id: await upload(supplier) }, supplier);
+  assert.equal(account.status, 201, JSON.stringify(account.data));
+  assert.equal(account.data.name_check, 'mismatch');
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, supplier)).data;
+  assert.deepEqual(file.submission_problems, ['File the identification of each director']);
+  await fileChecklist(ref, supplier);
+  assert.equal((await request('POST', `portal/compliance/${ref}/submit`, {}, supplier)).status, 200);
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'incorporation', document_id: await upload(supplier) }, supplier)).status, 409, 'locked while in review');
+
+  // Syndicate screens during review, then refers back with exactly what is missing.
+  await screenAll(ref, tokens.ops);
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'refer' }, tokens.checker)).status, 422, 'itemised list required');
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'refer', outstanding_items: ['A clearer copy of the director’s Ghana Card, both sides'] }, tokens.checker)).status, 200);
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, supplier)).data;
+  assert.equal(file.status, 'INFO_REQUIRED');
+  assert.deepEqual(file.reviews[0].outstanding_items, ['A clearer copy of the director’s Ghana Card, both sides']);
+  const [told] = await rows("SELECT body FROM notifications WHERE subject='We need a little more information' ORDER BY id DESC LIMIT 1");
+  assert.match(told.body, /Ghana Card/);
+  assert.equal((await request('POST', `portal/compliance/${ref}/documents`, { item_key: 'individual_ids', document_id: await upload(supplier), expires_on: inDays(900) }, supplier)).status, 201);
+  assert.equal((await request('POST', `portal/compliance/${ref}/submit`, {}, supplier)).status, 200);
+
+  // The mismatched account name needs a recorded justification before it can be verified; then sign-off.
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${account.data.id}/verify`, { decision: 'verify' }, tokens.ops)).status, 422);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${account.data.id}/verify`, { decision: 'verify', note: 'Sole proprietor account confirmed by bank letter' }, tokens.ops)).status, 200);
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'sign_off', risk_rating: 'low' }, tokens.checker)).status, 200);
+  const session = (await request('GET', 'portal/session', undefined, supplier)).data;
+  assert.equal(session.needs_onboarding, false);
+  assert.equal(session.lifecycle.status, 'VERIFIED');
+  // A verified account can no longer be changed in the portal (S2.4 → S7).
+  const again = await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Fidelity', account_number: '2000300040005', account_name: 'Volta Packaging Limited', evidence_document_id: await upload(supplier) }, supplier);
+  assert.equal(again.status, 409);
+  // The anchor sees the stage only: no documents, screening or account detail.
+  const anchorView = JSON.stringify((await request('GET', 'portal/bootstrap', undefined, tokens.anchorAdmin)).data);
+  assert.ok(!anchorView.includes('1441000123456') && !anchorView.includes('MANUAL-SCREEN-1'));
+});
+
+test('S2.6: a declined supplier sees a neutral outcome; the reason stays internal', async () => {
+  const ref = fx.temaRef;
+  const supplier = await login('owner@temafresh.test', 'Supplier-password-2');
+  await request('PATCH', `portal/compliance/${ref}/profile`, { legal_name: 'Tema Fresh Ltd', registration_number: 'TF-1', country: 'GH', registered_address: 'Community 1, Tema' }, supplier);
+  await fileChecklist(ref, supplier);
+  await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Nii Tetteh', is_director: true, ownership_percent: 100 }, supplier);
+  await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'GCB', account_number: '1022003004005', account_name: 'Tema Fresh Ltd', evidence_document_id: await upload(supplier) }, supplier);
+  assert.equal((await request('POST', `portal/compliance/${ref}/submit`, {}, supplier)).status, 200);
+  assert.equal((await request('POST', `portal/compliance/${ref}/decide`, { decision: 'decline', note: 'Director appears on an adverse-media list (internal reference AM-77)' }, tokens.checker)).status, 200);
+  const file = (await request('GET', `portal/compliance/${ref}`, undefined, supplier)).data;
+  assert.equal(file.status, 'DECLINED');
+  assert.ok(!JSON.stringify(file).includes('AM-77'));
+  assert.equal((await rows('SELECT note FROM portal_org_reviews WHERE org_ref=$1', [ref]))[0].note, null);
+  // The older verification queue cannot bypass the compliance file.
+  assert.equal((await request('POST', `portal/verification/${ref}`, { status: 'APPROVED' }, tokens.ops)).status, 409);
 });

@@ -23,11 +23,14 @@ export async function sessionData(actor: Actor) {
     const [user] = await rows('SELECT id,name,email,job_title,contact_phone,notification_preferences,email_verified_at,mfa_enrolled_at,portal_registration,super_admin FROM users WHERE id=$1', [actor.id]);
     const ref = await orgRef(actor);
     const [review] = ref ? await rows('SELECT status FROM portal_org_reviews WHERE org_ref=$1', [ref]) : [];
+    const [state] = ref && ref !== 'platform' ? await rows('SELECT status,tier,legacy FROM organisation_lifecycle WHERE org_ref=$1', [ref]) : [];
     const { mfa_verified: _verified, delegation, ...publicActor } = actor;
     const { super_admin: superAdmin, ...profile } = user;
     return { actor: publicActor, user: profile, org_ref: ref, super_admin: !delegation && actor.role === 'platform_ops' && !!superAdmin,
         // Shown as a persistent banner while an administrator works on behalf of the organisation.
         acting: delegation ? { target: delegation.target, name: delegation.target_name, reason: delegation.reason, admin_name: delegation.admin_name ?? delegation.admin_email } : null, needs_onboarding: user.portal_registration && (!ref || review?.status !== 'APPROVED'),
         // Operations sessions stay restricted to authenticator enrolment until a code has been verified.
-        mfa_enrolment_required: privilegedMfaRequired(actor), active_membership: actor.role !== 'buyer_admin' || !!actor.buyer_id };
+        mfa_enrolment_required: privilegedMfaRequired(actor), active_membership: actor.role !== 'buyer_admin' || !!actor.buyer_id,
+        // SRS status of the organisation (null for organisations live before the onboarding checklist).
+        lifecycle: state && !state.legacy ? { status: state.status, tier: state.tier } : null };
 }

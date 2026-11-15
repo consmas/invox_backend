@@ -47,7 +47,7 @@ export function secureHeaders(res: NextResponse) {
 /** Paths an account without an approved organisation (or without any buyer membership) may use: its own onboarding only. */
 function onboardingPath(method: string, path: string[]) {
   const route = `${method} ${path.join('/')}`;
-  return ['GET portal/session','GET portal/bootstrap','PATCH portal/profile','POST portal/notifications'].includes(route) || method === 'GET' && path[0] === 'field-definitions';
+  return ['GET portal/session','GET portal/bootstrap','PATCH portal/profile','POST portal/notifications'].includes(route) || method === 'GET' && path[0] === 'field-definitions' || path[0] === 'portal' && path[1] === 'compliance' && !!path[2];
 }
 async function gate(actor: Actor, method: string, path: string[]) {
   if (privilegedMfaRequired(actor)) {

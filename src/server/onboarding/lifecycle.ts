@@ -47,13 +47,15 @@ export const EDITABLE_SETUP = ['SETUP_IN_PROGRESS', 'DOCUMENTATION_OUTSTANDING',
 /** Statuses from which an organisation's people may use the platform (legacy organisations are always active). */
 export const LIVE = ['ACTIVE'];
 
-export type Lifecycle = { org_ref: string; counterparty: Counterparty; status: string; legacy: boolean; risk_rating: string | null; re_verification_due: string | null };
+export type Lifecycle = { org_ref: string; counterparty: Counterparty; status: string; legacy: boolean; tier: string; risk_rating: string | null; re_verification_due: string | null };
 export async function lifecycle(ref: string, db?: DB, lock = false): Promise<Lifecycle | null> {
   const [row] = await rows(`SELECT * FROM organisation_lifecycle WHERE org_ref=$1${lock ? ' FOR UPDATE' : ''}`, [ref], db);
   return (row as Lifecycle) ?? null;
 }
 export async function startLifecycle(ref: string, counterparty: Counterparty, status: string, actor: Actor | null, reason: string, db: DB) {
-  await rows('INSERT INTO organisation_lifecycle(org_ref,counterparty,status) VALUES($1,$2,$3)', [ref, counterparty, status], db);
+  // A supplier starts on the configured diligence tier (S2.1); anchors and funders follow the standard checklist.
+  const [tier] = counterparty === 'SUPPLIER' ? await rows("SELECT value #>> '{}' AS tier FROM onboarding_settings WHERE key='supplier_default_tier'", [], db) : [];
+  await rows('INSERT INTO organisation_lifecycle(org_ref,counterparty,status,tier) VALUES($1,$2,$3,$4)', [ref, counterparty, status, tier?.tier ?? 'standard'], db);
   await rows('INSERT INTO organisation_status_events(org_ref,previous_status,new_status,actor_id,reason) VALUES($1,NULL,$2,$3,$4)', [ref, status, actor?.id ?? null, reason], db);
 }
 /** Moves an organisation along an allowed edge of its status model and audits the change. */

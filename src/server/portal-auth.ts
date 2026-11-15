@@ -88,6 +88,7 @@ export async function portalAuth(req:NextRequest,action:string,body:Row,onBehalf
   const ref=await orgRef(actor);const [review]=ref?await rows('SELECT * FROM portal_org_reviews WHERE org_ref=$1',[ref]):[];return NextResponse.json({session:await sessionData(actor),review:review??null});
  }
  if(action==='onboarding'&&req.method==='POST'){
+  const self=await orgRef(actor);if(self){const [state]=await rows('SELECT legacy FROM organisation_lifecycle WHERE org_ref=$1',[self]);requireCondition(!state||state.legacy,409,'Complete your verification from the onboarding checklist');}
   const data=onboardingSchema.parse(body);
   return transaction(async db=>{const [user]=await rows('SELECT * FROM users WHERE id=$1 FOR UPDATE',[actor.id],db);const old=await orgRef(actor,db);requireCondition((user.portal_registration||old&&old!=='platform')&&(user.email_verified_at||actor.delegation),403,'Verify your registration email first');if(old)requireCondition(data.type.toLowerCase()===old.split('-')[0],422,'Organisation type must match your registered account');const [review]=old?await rows('SELECT * FROM portal_org_reviews WHERE org_ref=$1',[old],db):[];requireCondition(!review||review.status==='INFO_REQUIRED',409,'Your application is already under review');
    requireCondition(new Set(data.document_ids).size>=(data.type==='FINANCIER'?4:3),422,'Upload every required verification document');

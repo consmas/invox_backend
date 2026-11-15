@@ -11,6 +11,8 @@ export const SESSION_SECONDS = 60 * 60 * 2;
 export type Actor = { id: string; email: string; role: Role; buyer_id: string | null; mfa_verified?: boolean;
   /** The person's role inside their organisation (SRS §13.5–13.7), e.g. approver, viewer, credit_officer. */
   org_role?: string | null;
+  /** Provisioned or registered under the SRS process: a second factor is mandatory (S1.3, A4.10, F3.6). */
+  mfa_required?: boolean;
   /** Present when a super administrator is acting on behalf of this account's organisation. */
   delegation?: import('./act-for').Delegation };
 export const digest = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -32,7 +34,7 @@ export const hashPassword = (value: string) => bounded(() => bcrypt.hash(value, 
 // Devise's default bcrypt hashes ($2a$/$2b$) remain valid, including legacy short passwords.
 export const verifyPassword = (value: string, hash: string) => bounded(() => bcrypt.compare(value, hash));
 export function publicUser(user: Row): Actor {
-  return { id: String(user.id), email: user.email, role: roles[Number(user.role)], buyer_id: user.buyer_id == null ? null : String(user.buyer_id), org_role: user.org_role ?? null };
+  return { id: String(user.id), email: user.email, role: roles[Number(user.role)], buyer_id: user.buyer_id == null ? null : String(user.buyer_id), org_role: user.org_role ?? null, mfa_required: !!user.mfa_required };
 }
 export function requestToken(req: NextRequest): string | undefined {
   return req.headers.get('authorization')?.match(/^Bearer ([a-f0-9]{64})$/i)?.[1] ?? req.cookies.get(COOKIE_NAME)?.value;
@@ -51,10 +53,14 @@ export async function authenticate(req: NextRequest): Promise<Actor> {
 export function requireRole(actor: Actor, ...allowed: Role[]) {
   requireCondition(allowed.includes(actor.role), 403, 'Forbidden');
 }
-/** Operations accounts must complete authenticator enrolment and verification. Always on in production. */
+/**
+ * Operations accounts (NFR-SEC-002) and every person provisioned or registered under the SRS onboarding process
+ * (S1.3, A4.10, F3.6) must enrol and verify an authenticator before using the workspace. Always on in production.
+ * An administrator acting for an organisation has already proven their own second factor.
+ */
 export function privilegedMfaRequired(actor: Actor) {
   const enforced = process.env.NODE_ENV === 'production' || process.env.REQUIRE_OPERATIONS_MFA === 'true';
-  return enforced && actor.role === 'platform_ops' && !actor.mfa_verified;
+  return enforced && (actor.role === 'platform_ops' || !!actor.mfa_required) && !actor.mfa_verified && !actor.delegation;
 }
 export async function createSession(user: Row, db: DB, mfaVerified = false): Promise<string> {
   const [current]=await rows('SELECT disabled_at FROM users WHERE id=$1 FOR UPDATE',[user.id],db);

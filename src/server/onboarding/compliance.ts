@@ -3,7 +3,8 @@ import { type Actor } from '../auth';
 import { rows, transaction, type DB, type Row } from '../db';
 import { ApiError, requireCondition } from '../errors';
 import { id, date } from '../validation';
-import { portalEvent, notify, orgRef } from '../portal-support';
+import { portalEvent, notify, notifyContact, orgRef } from '../portal-support';
+import { ENTITY_TYPES, checklistItems } from './checklist';
 import { type Counterparty, EDITABLE_SETUP, lifecycle, transition } from './lifecycle';
 import { hasOpsRole, requireOpsRole } from './roles';
 import { provisioningProblems, requiredContacts } from './setup';
@@ -62,10 +63,9 @@ async function requireEditable(actor: Actor, file: File, who: Access, db: DB) {
 async function checklist(file: File, db: DB) {
   const country = String(file.record.country ?? '*').toUpperCase();
   const tier = file.counterparty === 'SUPPLIER' ? file.state.tier ?? 'simplified' : 'standard';
-  // The most specific configuration wins: the organisation's country, otherwise the default ('*').
-  const items = await rows(`SELECT DISTINCT ON (item_key) * FROM compliance_checklist_items WHERE counterparty=$1 AND tier=$2 AND country IN ($3,'*') ORDER BY item_key, (country='*'), sort`, [file.counterparty, tier, country], db);
+  const items = await checklistItems(file.counterparty, country, file.state.entity_type, tier, db);
   const filed = await rows('SELECT c.id,c.item_key,c.document_id,c.issued_on,c.expires_on,c.filed_at,d.file_name,d.size_bytes,d.review_status FROM compliance_documents c JOIN documents d ON d.id=c.document_id WHERE c.org_ref=$1 AND c.removed_at IS NULL ORDER BY c.id', [file.ref], db);
-  return items.sort((a, b) => a.sort - b.sort).map(item => {
+  return items.map(item => {
     const documents = filed.filter(f => f.item_key === item.item_key);
     const current = documents.filter(d => !d.expires_on || d.expires_on >= today());
     const state = !documents.length ? 'missing' : !current.length ? 'expired' : item.expires && current.some(d => !d.expires_on) ? 'expiry_missing' : 'filed';
@@ -91,6 +91,9 @@ async function fileDocument(actor: Actor, ref: string, body: unknown) {
     if (file.counterparty === 'SUPPLIER') await rows('UPDATE documents SET org_ref=$2,supplier_id=coalesce(supplier_id,$3::bigint),category=$4,updated_at=now() WHERE id=$1', [doc.id, ref, file.key, data.item_key], db);
     else if (file.counterparty === 'ANCHOR') await rows('UPDATE documents SET org_ref=$2,buyer_id=coalesce(buyer_id,$3::bigint),category=$4,updated_at=now() WHERE id=$1', [doc.id, ref, file.key, data.item_key], db);
     else await rows('UPDATE documents SET org_ref=$2,category=$3,updated_at=now() WHERE id=$1', [doc.id, ref, data.item_key], db);
+    // A2.2: every filed document carries its retention clock.
+    const years = Number(await setting('document_retention_years', db) ?? 7);
+    await rows('UPDATE documents SET retention_until=greatest(coalesce(retention_until,current_date),(current_date + make_interval(years => $2))::date) WHERE id=$1', [doc.id, years], db);
     const [row] = await rows('INSERT INTO compliance_documents(org_ref,item_key,document_id,issued_on,expires_on,filed_by) VALUES($1,$2,$3,$4,$5,$6) RETURNING id', [ref, data.item_key, doc.id, data.issued_on ?? null, data.expires_on ?? null, actor.id], db);
     await portalEvent(actor, 'compliance.document_filed', null, null, { org_ref: ref, record_id: ref, item_key: data.item_key, document_id: doc.id }, db);
     return { id: String(row.id) };
@@ -216,6 +219,7 @@ const accountInput = z.object({
   bank_name: text(200).min(2, 'Enter the bank'), bank_code: text(50).optional(), account_number: z.string().trim().transform(value => value.replace(/\s+/g, '')),
   account_name: text(200).min(2, 'Enter the account name'), currency: z.enum(['GHS', 'USD', 'EUR', 'NGN', 'KES']).default('GHS'),
   evidence_document_id: id, name_check: z.enum(['match', 'mismatch', 'not_available']).optional(), authorised_by_signatory_id: id.optional(),
+  request_document_id: id.optional(),
 });
 const corporate = (name: string) => normal(name).replace(/\b(limited|ltd|plc|llc|inc|company|co|the)\b/g, ' ').replace(/\s+/g, ' ').trim();
 function validAccount(country: string, number: string) { return country === 'GH' ? /^\d{10,16}$/.test(number) : /^[A-Za-z0-9]{6,34}$/.test(number); }
@@ -239,6 +243,12 @@ async function addAccount(actor: Actor, ref: string, body: unknown) {
         requireCondition(data.authorised_by_signatory_id, 422, 'Changing a verified account needs the authorising signatory');
         requireCondition((await rows('SELECT 1 FROM authorised_signatories WHERE id=$1 AND org_ref=$2 AND removed_at IS NULL', [data.authorised_by_signatory_id, ref], db)).length, 422, 'Choose one of this organisation’s authorised signatories');
       }
+      // FR-JNY-S-029: a verified supplier account changes only on the supplier's signed written request, retained here.
+      if (file.counterparty === 'SUPPLIER' && (await rows("SELECT 1 FROM settlement_accounts WHERE org_ref=$1 AND status='VERIFIED'", [ref], db)).length) {
+        requireCondition(data.request_document_id, 422, 'Attach the supplier’s signed written request for the change');
+        requireCondition((await rows("SELECT 1 FROM documents WHERE id=$1 AND upload_status='stored' AND (org_ref IS NULL OR org_ref=$2)", [data.request_document_id, ref], db)).length, 422, 'The signed request is not available');
+        await rows("UPDATE documents SET org_ref=$2,category='bank_change_request',updated_at=now() WHERE id=$1", [data.request_document_id, ref], db);
+      }
     }
     requireCondition(validAccount(String(file.record.country ?? '').toUpperCase(), data.account_number), 422, 'Enter a valid account number for this country');
     const [doc] = await rows('SELECT id,org_ref,uploaded_by,on_behalf_of_user_id,upload_status FROM documents WHERE id=$1', [data.evidence_document_id], db);
@@ -247,10 +257,10 @@ async function addAccount(actor: Actor, ref: string, body: unknown) {
     await rows('UPDATE documents SET org_ref=$2,category=$3,updated_at=now() WHERE id=$1', [doc.id, ref, 'bank_evidence'], db);
     // The account name must match the verified legal entity; a mismatch goes to manual review rather than being refused.
     const nameCheck = who.self || !data.name_check ? (corporate(data.account_name) === corporate(String(file.record.legal_name || file.record.name)) ? 'match' : 'mismatch') : data.name_check;
-    const [row] = await rows(`INSERT INTO settlement_accounts(org_ref,purpose,bank_name,bank_code,account_number,account_name,currency,evidence_document_id,name_check,authorised_by_signatory_id,replaces_id,recorded_by)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id`, [ref, purpose, data.bank_name, data.bank_code ?? null, data.account_number, data.account_name, data.currency, doc.id, nameCheck, data.authorised_by_signatory_id ?? null, live?.id ?? null, actor.id], db);
+    const [row] = await rows(`INSERT INTO settlement_accounts(org_ref,purpose,bank_name,bank_code,account_number,account_name,currency,evidence_document_id,name_check,authorised_by_signatory_id,replaces_id,recorded_by,request_document_id)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING id`, [ref, purpose, data.bank_name, data.bank_code ?? null, data.account_number, data.account_name, data.currency, doc.id, nameCheck, data.authorised_by_signatory_id ?? null, live?.id ?? null, actor.id, data.request_document_id ?? null], db);
     await portalEvent(actor, 'compliance.account_recorded', null, null, { org_ref: ref, record_id: ref, account_id: row.id, name_check: nameCheck, change: !!live }, db);
-    if (live) await notifyAccountChange(actor, file, 'A change to your bank account is awaiting verification', `A new ${purpose} account ending ${data.account_number.slice(-4)} was recorded and is awaiting verification. If you did not request this, contact INVOX immediately.`, db);
+    if (live) await notifyAccountChange(actor, file, 'A change to your bank account is under review', `A request to change the ${purpose} account to one ending ${data.account_number.slice(-4)} was received on ${new Date().toISOString().slice(0, 10)} and is under review. If you did not request this, contact INVOX immediately.`, db);
     return { id: String(row.id), name_check: nameCheck };
   });
 }
@@ -265,10 +275,28 @@ async function removeAccount(actor: Actor, ref: string, accountId: string) {
     return { removed: true };
   });
 }
-/** Every administrator of the organisation and the Syndicate team are told about any bank-account change (A2.5). */
+/**
+ * A bank-account change is announced to every administrator of the organisation, to its contacts by email, and to the
+ * relationship manager — never suppressible, since it is the primary defence against payment diversion (A2.5, F-007, S7).
+ */
 async function notifyAccountChange(actor: Actor, file: File, subject: string, body: string, db: DB) {
   const people = await rows(`SELECT id FROM users WHERE disabled_at IS NULL AND provisioning_status='ACTIVE' AND (org_ref=$1 OR ${file.counterparty === 'ANCHOR' ? 'buyer_id=$2' : 'id=$2'}) AND coalesce(org_role,'administrator') IN ('administrator','relationship_owner','operations')`, [file.ref, file.counterparty === 'SUPPLIER' ? (file.record.user_id ?? 0) : file.key], db);
-  for (const person of people) await notify(String(person.id), subject, body, null, actor, db);
+  for (const person of people) await notify(String(person.id), subject, body, null, actor, db, { orgRef: file.ref, force: true, eventType: 'bank_account_change' });
+  for (const contact of await rows("SELECT DISTINCT email FROM organisation_contacts WHERE org_ref=$1 AND email IS NOT NULL", [file.ref], db)) await notifyContact(contact.email, subject, body, actor, db, file.ref);
+  for (const manager of await relationshipManagers(file, db)) await notify(manager, `${file.record.legal_name || file.record.name}: ${subject.toLowerCase()}`, body, null, actor, db, { orgRef: file.ref, force: true, eventType: 'bank_account_change' });
+}
+/** The Syndicate relationship manager(s) for an organisation: its own, or — for a supplier — those of the anchors that invited it. */
+async function relationshipManagers(file: File, db: DB): Promise<string[]> {
+  const ids = file.state.relationship_manager_id ? [String(file.state.relationship_manager_id)] : (await rows(`SELECT DISTINCT l.relationship_manager_id AS id FROM programme_enrolments e JOIN programmes p ON p.id=e.programme_id JOIN organisation_lifecycle l ON l.org_ref='buyer-'||p.buyer_id WHERE e.supplier_id=$1 AND l.relationship_manager_id IS NOT NULL`, [file.counterparty === 'SUPPLIER' ? file.key : 0], db)).map(r => String(r.id));
+  if (ids.length) return ids;
+  return (await rows("SELECT id FROM users WHERE role=2 AND disabled_at IS NULL AND (ops_roles IS NULL OR 'relationship_manager'=ANY(ops_roles))", [], db)).map(r => String(r.id));
+}
+/** S2.5: the inviting anchors follow a supplier's onboarding at the level of stage only — never documents, screening or reasons. */
+async function tellAnchors(actor: Actor, file: File, message: string, db: DB) {
+  if (file.counterparty !== 'SUPPLIER') return;
+  const users = await rows(`SELECT DISTINCT u.id FROM programme_enrolments e JOIN programmes p ON p.id=e.programme_id JOIN users u ON u.buyer_id=p.buyer_id
+    WHERE e.supplier_id=$1 AND u.disabled_at IS NULL AND u.provisioning_status='ACTIVE' AND coalesce(u.org_role,'administrator') IN ('administrator','approver')`, [file.key], db);
+  for (const user of users) await notify(String(user.id), 'Supplier onboarding update', `${file.record.legal_name || file.record.name} ${message}`, null, actor, db, { eventType: 'supplier_onboarding' });
 }
 const accountDecision = z.object({ decision: z.enum(['verify', 'reject']), note: text(2000).optional() });
 async function verifyAccount(actor: Actor, ref: string, accountId: string, body: unknown) {
@@ -288,14 +316,17 @@ async function verifyAccount(actor: Actor, ref: string, accountId: string, body:
       await rows("UPDATE settlement_accounts SET status='VERIFIED',verified_by=$2,verified_at=now(),usable_from=now()+make_interval(days => $3),decision_note=$4 WHERE id=$1", [accountId, actor.id, days, data.note ?? null], db);
       await rows("UPDATE documents SET review_status='verified',verified_by=$2,verified_at=now() WHERE id=$1 AND review_status='pending' AND uploaded_by<>$2", [account.evidence_document_id, actor.id], db);
       if (account.replaces_id) await notifyAccountChange(actor, file, 'Your bank account was changed', `The ${account.purpose} account ending ${String(account.account_number).slice(-4)} is now verified and replaces the previous account from ${new Date(Date.now() + days * 86400000).toISOString().slice(0, 10)}. If you did not request this, contact INVOX immediately.`, db);
-    } else await rows("UPDATE settlement_accounts SET status='REJECTED',verified_by=NULL,decision_note=$2 WHERE id=$1", [accountId, data.note], db);
+    } else {
+      await rows("UPDATE settlement_accounts SET status='REJECTED',verified_by=NULL,decision_note=$2 WHERE id=$1", [accountId, data.note], db);
+      if (account.replaces_id) await notifyAccountChange(actor, file, 'Your bank account change was not made', `The requested change to the account ending ${String(account.account_number).slice(-4)} was not approved: ${data.note}. Your existing account stays in use.`, db);
+    }
     await portalEvent(actor, `compliance.account_${data.decision === 'verify' ? 'verified' : 'rejected'}`, data.note ?? null, null, { org_ref: ref, record_id: ref, account_id: accountId }, db);
     return { status: data.decision === 'verify' ? 'VERIFIED' : 'REJECTED' };
   });
 }
 
 // ── supplier's own company details (S1.4) and tier (S2.1) ───────────────────
-const profileInput = z.object({ legal_name: text(200).min(2), trading_name: text(200).optional(), registration_number: text(100).min(1), country: z.string().trim().toUpperCase().regex(/^[A-Z]{2}$/), registered_address: text(500).min(3), tax_id: text(100).optional(), industry: text(200).optional(), contact_phone: text(100).optional() }).partial();
+const profileInput = z.object({ entity_type: z.enum(ENTITY_TYPES.SUPPLIER as [string, ...string[]]), legal_name: text(200).min(2), trading_name: text(200).optional(), registration_number: text(100).min(1), country: z.string().trim().toUpperCase().regex(/^[A-Z]{2}$/), registered_address: text(500).min(3), tax_id: text(100).optional(), industry: text(200).optional(), contact_phone: text(100).optional() }).partial();
 async function updateSupplierProfile(actor: Actor, ref: string, body: unknown) {
   return transaction(async db => {
     const who = await access(actor, ref, db);
@@ -309,8 +340,10 @@ async function updateSupplierProfile(actor: Actor, ref: string, body: unknown) {
         WHERE upper(country)=upper($1) AND lower(trim(registration_number))=lower(trim($2)) AND ref<>$3 LIMIT 1`, [country, registration, ref], db);
       requireCondition(!clash, 409, 'This registration number is already registered on INVOX. Contact INVOX so your existing account can be linked.');
     }
-    const set = Object.entries(data).filter(([, value]) => value !== undefined);
-    requireCondition(set.length, 422, 'No changes were supplied');
+    if (data.entity_type) await rows('UPDATE organisation_lifecycle SET entity_type=$2,updated_at=now() WHERE org_ref=$1', [ref, data.entity_type], db);
+    const set = Object.entries(data).filter(([key, value]) => value !== undefined && key !== 'entity_type');
+    requireCondition(set.length || data.entity_type, 422, 'No changes were supplied');
+    if (!set.length) { await portalEvent(actor, 'compliance.profile_updated', null, null, { org_ref: ref, record_id: ref, entity_type: data.entity_type }, db); return { saved: true }; }
     const values = Object.fromEntries(set);
     if (values.trading_name || values.legal_name) values.name = values.trading_name ?? values.legal_name;
     const keys = Object.keys(values);
@@ -353,6 +386,7 @@ async function view(file: File, db: DB, who: Access) {
   }
   for (const item of items) if (item.state !== 'filed') problems.push(item.state === 'missing' ? `File the ${item.label.toLowerCase()}` : item.state === 'expired' ? `The ${item.label.toLowerCase()} has expired; file a current one` : `Enter the expiry date of the ${item.label.toLowerCase()}`);
   problems.push(...tree.problems);
+  if (file.counterparty !== 'SUPPLIER') for (const owner of tree.ubos.filter(o => !o.evidence_document_id)) problems.push(`Attach the supporting evidence for beneficial owner ${owner.name}`);
   if (!accounts.some(a => a.purpose === purpose && ['PENDING_VERIFICATION', 'VERIFIED'].includes(a.status))) problems.push(`Record ${ACCOUNT_LABEL[file.counterparty]}, with the bank statement or letter`);
   // Screening is performed by INVOX; for a supplier it happens after submission, during review.
   const screeningProblems = subjects.filter(s => s.state !== 'clear').map(s => s.state === 'not_screened' ? `Screen ${s.name}` : s.state === 'potential_match' ? `Resolve the potential screening match for ${s.name}` : `${s.name} is a confirmed screening match`);
@@ -365,7 +399,9 @@ async function view(file: File, db: DB, who: Access) {
     signoff_problems: [...problems, ...screeningProblems, ...accountProblems],
     reviews: who.ops ? reviews : reviews.map(r => ({ submitted_at: r.submitted_at, decision: r.decision, decided_at: r.decided_at, outstanding_items: r.decision === 'referred' ? r.outstanding_items : [] })) };
   const signatories = file.counterparty === 'SUPPLIER' ? [] : await rows('SELECT id,name,title FROM authorised_signatories WHERE org_ref=$1 AND removed_at IS NULL ORDER BY id', [file.ref], db);
-  return who.ops ? { ...base, screening: subjects, signatories } : base;
+  const notifications = who.ops ? await rows(`SELECT n.id,n.channel,n.status,n.subject,n.created_at,n.delivered_at,n.last_error,coalesce(n.recipient,u.email) AS recipient FROM notifications n LEFT JOIN users u ON u.id=n.user_id
+    WHERE n.org_ref=$1 OR (n.user_id IS NOT NULL AND (u.org_ref=$1 OR ${file.counterparty === 'ANCHOR' ? 'u.buyer_id=$2' : file.counterparty === 'SUPPLIER' ? 'u.id=$2' : 'u.id=$2'})) ORDER BY n.id DESC LIMIT 100`, [file.ref, file.counterparty === 'SUPPLIER' ? (file.record.user_id ?? 0) : file.key], db) : [];
+  return who.ops ? { ...base, entity_type: file.state.entity_type, screening: subjects, signatories, notifications } : { ...base, entity_type: file.state.entity_type };
 }
 async function getFile(actor: Actor, ref: string) {
   return transaction(async db => { const who = await access(actor, ref, db); return view(await load(ref, db), db, who); });
@@ -383,7 +419,8 @@ async function submit(actor: Actor, ref: string) {
     await rows(`INSERT INTO portal_org_reviews(org_ref,status,payload,submitted_by) VALUES($1,'PENDING_REVIEW',$2,$3) ON CONFLICT(org_ref) DO UPDATE SET status='PENDING_REVIEW',payload=$2,note=NULL,submitted_by=$3,submitted_at=now()`, [ref, JSON.stringify({ source: 'compliance_file' }), actor.id], db);
     if (file.counterparty === 'SUPPLIER') await rows("UPDATE suppliers SET verification_status='pending',onboarding_status='KYC_IN_REVIEW',updated_at=now() WHERE id=$1", [file.key], db);
     const officers = await rows("SELECT id FROM users WHERE role=2 AND disabled_at IS NULL AND id<>$1 AND (ops_roles IS NULL OR 'compliance_officer'=ANY(ops_roles))", [actor.id], db);
-    for (const officer of officers) await notify(String(officer.id), 'Compliance file awaiting sign-off', `${current.name} is waiting for compliance review.`, null, actor, db);
+    for (const officer of officers) await notify(String(officer.id), 'Compliance file awaiting sign-off', `${current.name} is waiting for compliance review.`, null, actor, db, { orgRef: ref });
+    await tellAnchors(actor, file, 'has submitted its verification and is being reviewed.', db);
     await portalEvent(actor, 'compliance.submitted', null, null, { org_ref: ref, record_id: ref }, db);
     return { status: target };
   });
@@ -427,7 +464,10 @@ async function decide(actor: Actor, ref: string, body: unknown) {
     } else await rows(`UPDATE ${table} SET verification_status=$2,onboarding_status=$3,updated_at=now() WHERE ${keyColumn}=$1`, [file.key, data.decision === 'refer' ? 'pending' : 'rejected', target], db);
     // Suppliers hear from the platform; anchors and funders are contacted by their relationship manager off-system.
     if (file.counterparty === 'SUPPLIER' && file.record.user_id) await notify(String(file.record.user_id), data.decision === 'sign_off' ? 'Your organisation is verified' : data.decision === 'refer' ? 'We need a little more information' : 'Update on your verification', data.decision === 'sign_off' ? 'Your verification is complete. Review and accept the programme terms to start.' : data.decision === 'refer' ? `Please provide: ${data.outstanding_items.join('; ')}` : 'We are unable to complete your verification. Your customer’s INVOX relationship manager will be in touch.', null, actor, db);
-    await notify(String(review.submitted_by), `Compliance decision: ${data.decision.replace('_', ' ')}`, `${current.name}: ${target.toLowerCase().replaceAll('_', ' ')}.`, null, actor, db);
+    const internal = new Set([String(review.submitted_by), ...await relationshipManagers(file, db)]);
+    for (const person of internal) if ((await rows('SELECT 1 FROM users WHERE id=$1 AND role=2', [person], db)).length)
+      await notify(person, `Compliance decision: ${data.decision.replace('_', ' ')}`, `${current.name}: ${target.toLowerCase().replaceAll('_', ' ')}.${data.decision === 'refer' ? ` Outstanding: ${data.outstanding_items.join('; ')}` : data.decision === 'decline' ? ` Reason (internal): ${data.note}` : ''}`, null, actor, db, { orgRef: ref });
+    await tellAnchors(actor, file, data.decision === 'sign_off' ? 'is verified. It accepts the programme terms next.' : data.decision === 'refer' ? 'has been asked for more information to complete its verification.' : 'could not be verified. Your relationship manager will be in touch.', db);
     await portalEvent(actor, `compliance.${data.decision === 'sign_off' ? 'signed_off' : data.decision === 'refer' ? 'referred' : 'declined'}`, data.decision === 'decline' ? null : note, null, { org_ref: ref, record_id: ref }, db);
     return { status: target };
   });

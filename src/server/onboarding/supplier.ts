@@ -3,9 +3,9 @@ import { type Actor, digest, newToken, hashPassword, revokeSessions } from '../a
 import { rows, transaction, type DB, type Row } from '../db';
 import { requireCondition } from '../errors';
 import { id, email } from '../validation';
-import { sendLink, appUrl } from '../mail';
+import { appUrl, mailConfigured, requireMailConfiguration, sendNotice } from '../mail';
 import { sendSms } from '../integrations';
-import { portalEvent, notify } from '../portal-support';
+import { portalEvent, notify, requestIp } from '../portal-support';
 import { lifecycle, startLifecycle, transition } from './lifecycle';
 
 /**
@@ -28,19 +28,41 @@ async function validityDays(db: DB) {
   const [row] = await rows("SELECT value FROM onboarding_settings WHERE key='invitation_validity_days'", [], db);
   return Number(row?.value?.SUPPLIER ?? 7);
 }
-type Delivery = { channel: 'email' | 'sms' | 'existing'; sent: boolean; preview_url?: string; warning?: string };
-/** Sends the enrolment link on the channel the anchor's data allows; a failure is reported, never silent (§13.4). */
-async function deliver(supplier: Row, anchorName: string, token: string): Promise<Delivery> {
-  const link = `${appUrl()}/invite?token=${token}`;
+type Delivery = { channel: 'email' | 'sms' | 'existing'; sent: boolean; preview_url?: string; warning?: string; logged?: 'delivered' | 'failed' | 'skipped' };
+/** Channel templates are configuration (FR-JNY-S-001); placeholders: {anchor} {link} {expiry} {remaining}. */
+export async function template(name: string, channel: 'email' | 'sms', values: Record<string, string>, db?: DB) {
+  const [row] = await rows("SELECT value FROM onboarding_settings WHERE key='templates'", [], db);
+  const entry = row?.value?.[name]?.[channel] ?? {};
+  const fill = (text: string) => text.replace(/\{(\w+)\}/g, (_, key: string) => values[key] ?? '');
+  return { subject: fill(entry.subject ?? ''), body: fill(entry.body ?? '') };
+}
+/**
+ * Sends the enrolment link on the channel the anchor's data allows; each channel's link is tagged so the platform
+ * learns which channel the supplier answered on (S1.2). A failure is reported, never silent (§13.4).
+ */
+async function deliver(supplier: Row, anchorName: string, token: string, expiresAt: Date): Promise<Delivery> {
+  const link = (via: string) => `${appUrl()}/invite?token=${token}&via=${via}`;
+  const expiry = expiresAt.toISOString().slice(0, 10);
   if (supplier.email) {
-    try { return { channel: 'email', sent: true, ...await sendLink(supplier.email, `${anchorName} invites you to get paid early with INVOX`, link) }; }
-    catch (error) { if (!supplier.contact_phone) return { channel: 'email', sent: false, warning: `The invitation email could not be sent (${(error as Error).message}).` }; }
+    const message = await template('supplier_invitation', 'email', { anchor: anchorName, link: link('email'), expiry });
+    try {
+      await sendSupplierEmail(supplier.email, message.subject, message.body);
+      // Without a mail server (development only) the link is previewed and the log says so; it is never recorded as delivered.
+      if (!(await mailConfigured())) return { channel: 'email', sent: true, preview_url: link('email'), logged: 'skipped' };
+      return { channel: 'email', sent: true };
+    } catch (error) { if (!supplier.contact_phone) return { channel: 'email', sent: false, warning: `The invitation email could not be sent (${(error as Error).message}).` }; }
   }
-  try { await sendSms([supplier.contact_phone], `${anchorName} invites you to get paid early on its invoices with INVOX. Set up your account: ${link}`); return { channel: 'sms', sent: true }; }
+  const message = await template('supplier_invitation', 'sms', { anchor: anchorName, link: link('sms'), expiry });
+  try { await sendSms([supplier.contact_phone], message.body); return { channel: 'sms', sent: true }; }
   catch (error) {
-    const preview = ['development', 'test'].includes(process.env.NODE_ENV ?? '') ? { preview_url: link } : {};
+    const preview = ['development', 'test'].includes(process.env.NODE_ENV ?? '') ? { preview_url: link('sms') } : {};
     return { channel: 'sms', sent: false, warning: `The invitation SMS could not be sent (${(error as Error).message}).`, ...preview };
   }
+}
+/** Email delivery for invitations: production needs a mail server; development without one only previews the link. */
+async function sendSupplierEmail(address: string, subject: string, body: string) {
+  await requireMailConfiguration();
+  await sendNotice(address, subject, body);
 }
 export async function inviteSupplier(actor: Actor, body: unknown) {
   const data = inviteInput.parse(body);
@@ -53,13 +75,16 @@ export async function inviteSupplier(actor: Actor, body: unknown) {
     // Never duplicate: the same email, or the same registration number in the same country, is the same supplier.
     const [existing] = await rows(`SELECT * FROM suppliers WHERE ($1::text IS NOT NULL AND lower(email)=$1) OR ($2::text IS NOT NULL AND upper(country)=$3 AND lower(trim(registration_number))=lower($2)) ORDER BY id LIMIT 1`, [data.email ?? null, data.registration_number ?? null, data.country], db);
     requireCondition(!existing?.archived_at, 409, 'This supplier cannot be invited at the moment. Contact INVOX operations.');
-    let supplier = existing; let token: string | null = null;
+    let supplier = existing; let token: string | null = null; let expiresAt = new Date();
     if (!supplier) {
       token = newToken();
       const days = await validityDays(db);
+      expiresAt = new Date(Date.now() + days * 86400000);
       [supplier] = await rows(`INSERT INTO suppliers(name,email,contact_phone,country,registration_number,invitation_token,invited_at,invitation_expires_at,created_at,updated_at)
         VALUES($1,$2,$3,$4,$5,$6,now(),now()+make_interval(days => $7),now(),now()) RETURNING *`, [data.name, data.email ?? null, data.phone ?? null, data.country, data.registration_number ?? null, digest(token), days], db);
-      await startLifecycle(`supplier-${supplier.id}`, 'SUPPLIER', 'INVITED', actor, `Invited by ${programme.anchor_name}`, db);
+      // The supplier's relationship manager is the anchor's (S2.6 internal notifications route to them).
+      const [anchorState] = await rows('SELECT relationship_manager_id FROM organisation_lifecycle WHERE org_ref=$1', [`buyer-${programme.buyer_id}`], db);
+      await startLifecycle(`supplier-${supplier.id}`, 'SUPPLIER', 'INVITED', actor, `Invited by ${programme.anchor_name}`, db, { relationshipManagerId: anchorState?.relationship_manager_id ?? null });
     }
     await rows('INSERT INTO portal_programme_suppliers VALUES($1,$2) ON CONFLICT DO NOTHING', [programme.id, supplier.id], db);
     await rows(`INSERT INTO portal_supplier_relationships(buyer_id,supplier_id,contact_name,contact_email,contact_phone,created_by) VALUES($1,$2,$3,$4,$5,$6)
@@ -70,10 +95,14 @@ export async function inviteSupplier(actor: Actor, body: unknown) {
     // An existing supplier joins from its own workspace (S1.6): it is told in-app, the anchor learns nothing more.
     if (!token) for (const user of await rows('SELECT id FROM users WHERE id=$1 OR org_ref=$2', [supplier.user_id ?? 0, `supplier-${supplier.id}`], db))
       await notify(String(user.id), 'New programme invitation', `${programme.anchor_name} invited you to join ${programme.name}. Review the programme terms to take part.`, null, actor, db);
-    return { supplier, token, programme };
+    return { supplier, token, programme, expiresAt };
   });
-  const delivery: Delivery = outcome.token ? await deliver(outcome.supplier, outcome.programme.anchor_name, outcome.token) : { channel: 'existing', sent: true };
+  const delivery: Delivery = outcome.token ? await deliver(outcome.supplier, outcome.programme.anchor_name, outcome.token, outcome.expiresAt) : { channel: 'existing', sent: true };
   await rows('UPDATE programme_enrolments SET channel=$3,delivery_status=$4,updated_at=now() WHERE programme_id=$1 AND supplier_id=$2', [outcome.programme.id, outcome.supplier.id, delivery.channel, delivery.sent ? 'sent' : 'failed']).catch(() => undefined);
+  // Every notice is logged against the organisation with its channel and delivery outcome (§13.4).
+  if (outcome.token) await rows(`INSERT INTO notifications(recipient,event_type,channel,subject,body,status,created_by,org_ref,delivery_attempts,delivered_at,last_error)
+    VALUES($1,'supplier_invitation',$2,$3,$4,$5::varchar,$6,$7,1,CASE WHEN $5::varchar='delivered' THEN now() END,$8)`,
+    [delivery.channel === 'sms' ? outcome.supplier.contact_phone : outcome.supplier.email, delivery.channel, `Invitation from ${outcome.programme.anchor_name}`, `Invitation to join ${outcome.programme.name} (link expires ${outcome.expiresAt.toISOString().slice(0, 10)})`, delivery.logged ?? (delivery.sent ? 'delivered' : 'failed'), actor.id, `supplier-${outcome.supplier.id}`, delivery.warning ?? null]).catch(error => console.error('Invitation log failed', (error as Error).message));
   return { id: String(outcome.supplier.id), delivery, ...(delivery.preview_url ? { preview_url: delivery.preview_url } : {}), ...(delivery.warning ? { warning: delivery.warning } : {}) };
 }
 
@@ -89,7 +118,9 @@ export async function invitationDetails(token: string) {
  * S1.3: the invited supplier creates its log-in. The first user is the supplier administrator; the organisation
  * moves from INVITED to REGISTERED and its programme links stay PENDING_ENROLMENT until verification and terms.
  */
-export async function registerInvitedSupplier(input: { email: string; password: string; token: string; name?: string }, db: DB) {
+export async function registerInvitedSupplier(input: { email: string; password: string; token: string; name?: string; via?: string; accept_terms?: boolean }, db: DB) {
+  // FR-ONB-010: explicit, timestamped consent to the terms of use and privacy notice before any account exists.
+  requireCondition(input.accept_terms === true, 422, 'Accept the terms of use and privacy notice to continue');
   const [supplier] = await rows('SELECT * FROM suppliers WHERE invitation_token=$1 AND invitation_expires_at>now() FOR UPDATE', [digest(input.token)], db);
   requireCondition(supplier, 422, 'Invitation is invalid or expired');
   requireCondition(!supplier.email || supplier.email.toLowerCase() === input.email, 422, 'Use the email address the invitation was sent to');
@@ -100,15 +131,19 @@ export async function registerInvitedSupplier(input: { email: string; password: 
     const [account] = await rows('SELECT * FROM users WHERE id=$1 AND role=1 FOR UPDATE', [supplier.user_id], db);
     requireCondition(account, 422, 'Invitation is invalid');
     await revokeSessions(String(account.id), db);
-    [user] = await rows("UPDATE users SET encrypted_password=$2,email_verified_at=now(),org_ref=$3,org_role=coalesce(org_role,'administrator'),provisioning_status='ACTIVE',updated_at=now() WHERE id=$1 RETURNING *", [account.id, hash, `supplier-${supplier.id}`], db);
+    [user] = await rows("UPDATE users SET encrypted_password=$2,email_verified_at=now(),org_ref=$3,org_role=coalesce(org_role,'administrator'),provisioning_status='ACTIVE',mfa_required=true,updated_at=now() WHERE id=$1 RETURNING *", [account.id, hash, `supplier-${supplier.id}`], db);
   } else {
     const [taken] = await rows('SELECT id FROM users WHERE lower(email)=$1', [input.email], db);
     requireCondition(!taken, 409, 'An account with this email already exists. Sign in to accept the invitation.');
-    [user] = await rows(`INSERT INTO users(email,name,encrypted_password,role,jti,portal_registration,email_verified_at,org_ref,org_role,provisioning_status,created_at,updated_at)
-      VALUES($1,$2,$3,1,gen_random_uuid()::text,true,now(),$4,'administrator','ACTIVE',now(),now()) RETURNING *`, [input.email, input.name ?? null, hash, `supplier-${supplier.id}`], db);
+    [user] = await rows(`INSERT INTO users(email,name,encrypted_password,role,jti,portal_registration,email_verified_at,org_ref,org_role,provisioning_status,mfa_required,created_at,updated_at)
+      VALUES($1,$2,$3,1,gen_random_uuid()::text,true,now(),$4,'administrator','ACTIVE',true,now(),now()) RETURNING *`, [input.email, input.name ?? null, hash, `supplier-${supplier.id}`], db);
     await rows('UPDATE suppliers SET user_id=$2,email=coalesce(email,$3),updated_at=now() WHERE id=$1', [supplier.id, user.id, input.email], db);
   }
-  await rows('UPDATE suppliers SET invitation_token=NULL,invitation_expires_at=NULL,updated_at=now() WHERE id=$1', [supplier.id], db);
+  const via = input.via === 'sms' ? 'sms' : input.via === 'email' ? 'email' : null;
+  await rows('UPDATE suppliers SET invitation_token=NULL,invitation_expires_at=NULL,preferred_channel=coalesce($2,preferred_channel),updated_at=now() WHERE id=$1', [supplier.id, via], db);
+  if (via) await rows('UPDATE programme_enrolments SET responded_channel=$2,updated_at=now() WHERE supplier_id=$1 AND responded_channel IS NULL', [supplier.id, via], db);
+  const [versions] = await rows("SELECT value FROM onboarding_settings WHERE key='terms_versions'", [], db);
+  await rows('INSERT INTO platform_consents(user_id,terms_version,privacy_version,context,ip) VALUES($1,$2,$3,$4,$5)', [user.id, versions?.value?.terms_of_use ?? 'unversioned', versions?.value?.privacy_notice ?? 'unversioned', 'supplier_registration', requestIp()], db);
   const ref = `supplier-${supplier.id}`;
   if (!await lifecycle(ref, db)) await startLifecycle(ref, 'SUPPLIER', 'INVITED', null, 'Invitation issued before onboarding statuses existed', db);
   const state = await lifecycle(ref, db);

@@ -159,11 +159,19 @@ test('F1: a funder is set up with its relationship owner and credit officers car
   const body = { counterparty: 'FUNDER', agreement: { reference: 'RPA-FIRSTCAP', executed_on: today, document_ids: [await upload(tokens.ops)] },
     organisation: { legal_name: 'First Capital Bank PLC', country: 'GH', registration_number: 'BANK-77', registered_address: 'Ridge, Accra', funder_type: 'bank', regulatory_status: 'Licensed universal bank (Bank of Ghana)', licence_reference: 'BoG/UB/0042' } };
   assert.equal((await request('POST', 'portal/setup', body, tokens.ops)).status, 422, 'relationship owner required');
-  const created = await request('POST', 'portal/setup', { ...body, relationship_owner: { name: 'Esi Quaye', email: 'esi@firstcap.test' } }, tokens.ops);
+  const owner = { name: 'Esi Quaye', email: 'esi@firstcap.test' };
+  const noPack = await request('POST', 'portal/setup', { ...body, entity_type: 'bank', relationship_owner: owner }, tokens.ops);
+  assert.equal(noPack.status, 422, 'due-diligence pack required (FR-JNY-F-003)');
+  assert.match(noPack.data.error, /before creating the funder/);
+  const pack = [];
+  for (const item of ['incorporation', 'constitution', 'regulatory_licence', 'signatory_authority', 'ownership_structure', 'source_of_funds', 'tax_documentation'])
+    pack.push({ item_key: item, document_id: await upload(tokens.ops), expires_on: ['regulatory_licence', 'tax_documentation'].includes(item) ? '2030-12-31' : undefined });
+  const created = await request('POST', 'portal/setup', { ...body, entity_type: 'bank', relationship_owner: owner, due_diligence: pack }, tokens.ops);
   assert.equal(created.status, 201, JSON.stringify(created.data));
   const ref = created.data.ref; const ownerId = ref.split('-')[1];
-  const [owner] = await rows('SELECT org_role,provisioning_status,role FROM users WHERE id=$1', [ownerId]);
-  assert.deepEqual([owner.org_role, owner.provisioning_status, owner.role], ['relationship_owner', 'PROVISIONED_NOT_ACTIVATED', 3]);
+  const [ownerRow] = await rows('SELECT org_role,provisioning_status,role,mfa_required FROM users WHERE id=$1', [ownerId]);
+  assert.deepEqual([ownerRow.org_role, ownerRow.provisioning_status, ownerRow.role, ownerRow.mfa_required], ['relationship_owner', 'PROVISIONED_NOT_ACTIVATED', 3, true]);
+  assert.equal((await rows('SELECT count(*)::int AS n FROM compliance_documents WHERE org_ref=$1', [ref]))[0].n, 7);
   assert.equal((await request('POST', `portal/setup/${ref}/users`, { name: 'Ops', email: 'ops@firstcap.test', org_role: 'operations', approval_limit: '100' }, tokens.ops)).status, 422, 'authority only for credit officers');
   assert.equal((await request('POST', `portal/setup/${ref}/users`, { name: 'Kwame Credit', email: 'credit@firstcap.test', org_role: 'credit_officer' }, tokens.ops)).status, 201);
   let detail = (await request('GET', `portal/setup/${ref}`, undefined, tokens.ops)).data;
@@ -203,9 +211,13 @@ test('S1: an anchor invites suppliers by email or phone; existing suppliers are 
   assert.equal((await rows('SELECT status,channel FROM programme_enrolments WHERE supplier_id=$1', [byEmail.data.id]))[0].status, 'PENDING_ENROLMENT');
 
   // Registration from the link creates the supplier administrator and moves the organisation to REGISTERED.
-  assert.equal((await request('POST', 'auth/signup', { email: 'someone@else.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token })).status, 422);
-  assert.equal((await request('POST', 'auth/signup', { email: 'ar@volta.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token, name: 'Efua Owusu' })).status, 201);
-  assert.equal((await request('POST', 'auth/signup', { email: 'ar@volta.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token })).status, 422, 'single use');
+  assert.equal((await request('POST', 'auth/signup', { email: 'someone@else.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token, accept_terms: true })).status, 422);
+  assert.equal((await request('POST', 'auth/signup', { email: 'ar@volta.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token, name: 'Efua Owusu' })).status, 422, 'consent required');
+  assert.equal((await request('POST', 'auth/signup', { email: 'ar@volta.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token, name: 'Efua Owusu', accept_terms: true, via: 'email' })).status, 201);
+  const [consent] = await rows("SELECT c.context,c.terms_version FROM platform_consents c JOIN users u ON u.id=c.user_id WHERE u.email='ar@volta.test'");
+  assert.deepEqual([consent.context, consent.terms_version], ['supplier_registration', '2026-11']);
+  assert.equal((await rows('SELECT responded_channel FROM programme_enrolments WHERE supplier_id=$1', [byEmail.data.id]))[0].responded_channel, 'email');
+  assert.equal((await request('POST', 'auth/signup', { email: 'ar@volta.test', password: 'Supplier-password-1', role: 'supplier_user', invite_token: token, accept_terms: true })).status, 422, 'single use');
   const [account] = await rows('SELECT org_role,org_ref,provisioning_status FROM users WHERE email=$1', ['ar@volta.test']);
   assert.deepEqual([account.org_role, account.org_ref, account.provisioning_status], ['administrator', supplierRef, 'ACTIVE']);
   assert.equal((await rows('SELECT status FROM organisation_lifecycle WHERE org_ref=$1', [supplierRef]))[0].status, 'REGISTERED');
@@ -226,8 +238,11 @@ test('S1: an anchor invites suppliers by email or phone; existing suppliers are 
   assert.deepEqual([byPhone.data.delivery.channel, byPhone.data.delivery.sent], ['sms', false]);
   assert.match(byPhone.data.warning, /SMS could not be sent/);
   assert.equal((await rows('SELECT delivery_status FROM programme_enrolments WHERE supplier_id=$1', [byPhone.data.id]))[0].delivery_status, 'failed');
+  // Both invitations are logged against the supplier with their channel and outcome (§13.4).
+  const logged = await rows("SELECT org_ref,channel,status FROM notifications WHERE event_type='supplier_invitation' ORDER BY id");
+  assert.deepEqual(logged.map(n => `${n.org_ref}:${n.channel}:${n.status}`), [`${supplierRef}:email:skipped`, `supplier-${byPhone.data.id}:sms:failed`]);
   const phoneToken = new URL(byPhone.data.preview_url).searchParams.get('token')!; fx.temaRef = `supplier-${byPhone.data.id}`;
-  assert.equal((await request('POST', 'auth/signup', { email: 'owner@temafresh.test', password: 'Supplier-password-2', role: 'supplier_user', invite_token: phoneToken })).status, 201, 'any email when invited by phone');
+  assert.equal((await request('POST', 'auth/signup', { email: 'owner@temafresh.test', password: 'Supplier-password-2', role: 'supplier_user', invite_token: phoneToken, accept_terms: true, via: 'sms' })).status, 201, 'any email when invited by phone');
   assert.equal((await rows('SELECT email FROM suppliers WHERE id=$1', [byPhone.data.id]))[0].email, 'owner@temafresh.test');
 
   // Released programmes only.
@@ -274,7 +289,12 @@ test('A2: the anchor compliance file is complete, screened and independently sig
   file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
   assert.ok(file.submission_problems.some((p: string) => p.includes('Acme Group Holdings holds 60.0%')));
   assert.ok(file.submission_problems.includes('Record at least one director'));
-  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Ama Owner', nationality: 'GH', ownership_percent: 100, parent_id: holding.data.id }, tokens.ops)).status, 201);
+  const amaOwner = await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Ama Owner', nationality: 'GH', ownership_percent: 100, parent_id: holding.data.id }, tokens.ops);
+  assert.equal(amaOwner.status, 201);
+  file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
+  assert.ok(file.submission_problems.includes('Attach the supporting evidence for beneficial owner Ama Owner'));
+  assert.equal((await request('DELETE', `portal/compliance/${ref}/owners/${amaOwner.data.id}`, undefined, tokens.ops)).status, 200);
+  assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Ama Owner', nationality: 'GH', ownership_percent: 100, parent_id: holding.data.id, evidence_document_id: await upload(tokens.ops) }, tokens.ops)).status, 201);
   assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'entity', name: 'Bad', is_director: true }, tokens.ops)).status, 422);
   assert.equal((await request('POST', `portal/compliance/${ref}/owners`, { kind: 'natural', name: 'Kwesi Director', is_director: true }, tokens.ops)).status, 201);
   file = (await request('GET', `portal/compliance/${ref}`, undefined, tokens.ops)).data;
@@ -404,4 +424,75 @@ test('S2.6: a declined supplier sees a neutral outcome; the reason stays interna
   assert.equal((await rows('SELECT note FROM portal_org_reviews WHERE org_ref=$1', [ref]))[0].note, null);
   // The older verification queue cannot bypass the compliance file.
   assert.equal((await request('POST', `portal/verification/${ref}`, { status: 'APPROVED' }, tokens.ops)).status, 409);
+});
+
+// ── alignment review: requirements the first two increments had not fully met ─
+test('FR-JNY-A-003/S-004: the checklist follows jurisdiction, entity type and tier, with explicit exclusions', async () => {
+  const anchor = await request('POST', 'portal/setup', await anchorBody('PART-1', {}), tokens.ops);
+  // Default (limited company) anchors file a constitution; partnerships file a partnership deed instead.
+  const limited = (await request('GET', `portal/compliance/${anchor.data.ref}`, undefined, tokens.ops)).data;
+  assert.ok(limited.checklist.some((i: any) => i.key === 'constitution'));
+  const partnership = await request('POST', 'portal/setup', { ...(await anchorBody('PART-2')), entity_type: 'partnership' }, tokens.ops);
+  const deed = (await request('GET', `portal/compliance/${partnership.data.ref}`, undefined, tokens.ops)).data;
+  assert.equal(deed.entity_type, 'partnership');
+  assert.ok(deed.checklist.some((i: any) => i.key === 'partnership_deed'));
+  assert.ok(!deed.checklist.some((i: any) => i.key === 'constitution'));
+  assert.equal((await request('POST', 'portal/setup', { ...(await anchorBody('PART-3')), entity_type: 'spaceship' }, tokens.ops)).status, 422);
+});
+
+test('S2.5/S-029/A2.5: anchors see stage only; a verified supplier account changes only on a signed request, with three notices', async () => {
+  const [stage] = await rows("SELECT body FROM notifications WHERE event_type='supplier_onboarding' AND body LIKE 'Volta Packaging Limited is verified%' LIMIT 1");
+  assert.ok(stage, 'the inviting anchor was told the supplier is verified');
+  const anchorNotices = await rows("SELECT body FROM notifications n JOIN users u ON u.id=n.user_id WHERE u.buyer_id=$1 AND n.event_type='supplier_onboarding'", [fx.liveBuyer.id]);
+  assert.ok(anchorNotices.every(n => !/Ghana Card|1441000123456|screen/i.test(n.body)), 'stage only, never documents or detail');
+  const ref = fx.voltaRef;
+  const evidence = await upload(tokens.ops);
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Fidelity', account_number: '2000300040005', account_name: 'Volta Packaging Limited', evidence_document_id: evidence }, tokens.ops)).status, 422, 'signed request required');
+  const change = await request('POST', `portal/compliance/${ref}/accounts`, { bank_name: 'Fidelity', account_number: '2000300040005', account_name: 'Volta Packaging Limited', evidence_document_id: evidence, request_document_id: await upload(tokens.ops) }, tokens.ops);
+  assert.equal(change.status, 201, JSON.stringify(change.data));
+  assert.equal((await request('POST', `portal/compliance/${ref}/accounts/${change.data.id}/verify`, { decision: 'verify' }, tokens.checker)).status, 200);
+  const [supplierUser] = await rows("SELECT id FROM users WHERE email='ar@volta.test'");
+  const notices = await rows("SELECT subject,channel FROM notifications WHERE user_id=$1 AND event_type='bank_account_change' ORDER BY id", [supplierUser.id]);
+  assert.deepEqual([...new Set(notices.map(n => n.subject))], ['A change to your bank account is under review', 'Your bank account was changed']);
+  assert.ok(notices.some(n => n.channel === 'email'), 'never suppressible: emailed as well as in-app');
+  const relationshipNotices = await rows("SELECT 1 FROM notifications n JOIN users u ON u.id=n.user_id WHERE u.role=2 AND n.event_type='bank_account_change'");
+  assert.ok(relationshipNotices.length >= 2, 'the relationship manager is told too');
+});
+
+test('Onboarding diary: stalled suppliers are reminded on schedule; email is queued and never silently lost', async () => {
+  const { onboardingReminders, dispatchNotifications } = await import('../src/server/onboarding/diary');
+  const invited = await request('POST', 'portal/suppliers', { name: 'Slow Supplies', email: 'slow@supplies.test', programme_id: fx.programme.id }, tokens.anchorAdmin);
+  assert.equal(invited.status, 201, JSON.stringify(invited.data));
+  assert.equal(await onboardingReminders(new Date()), 0, 'not due yet');
+  const later = new Date(Date.now() + 4 * 86400000);
+  assert.ok(await onboardingReminders(later) >= 1);
+  const [enrolment] = await rows('SELECT reminders_sent FROM programme_enrolments WHERE supplier_id=$1', [invited.data.id]);
+  assert.equal(enrolment.reminders_sent, 1);
+  assert.equal(await onboardingReminders(later), 0, 'next reminder only at the next scheduled interval');
+  const [queued] = await rows("SELECT subject,body FROM notifications WHERE recipient='slow@supplies.test' AND channel='email' AND event_type='onboarding_reminder'");
+  assert.match(queued.subject, /Finish setting up INVOX for Harbour Retail/);
+  const [toAnchor] = await rows("SELECT body FROM notifications WHERE user_id=$1 AND subject='Supplier onboarding stalled' ORDER BY id DESC LIMIT 1", [fx.anchorAdmin.id]);
+  assert.match(toAnchor.body, /Slow Supplies has not finished creating its log-in/);
+  // Without a mail server (this environment) queued email is marked skipped rather than "delivered".
+  await dispatchNotifications();
+  assert.equal((await rows("SELECT count(*)::int AS n FROM notifications WHERE channel='email' AND status='delivered'"))[0].n, 0);
+  assert.ok((await rows("SELECT count(*)::int AS n FROM notifications WHERE channel='email' AND status='skipped'"))[0].n > 0);
+});
+
+test('S1.3/NFR-SEC-002: invited people must enrol a second factor; the audit trail records where actions came from', async () => {
+  Object.assign(process.env, { REQUIRE_OPERATIONS_MFA: 'true', CLIENT_IP_HEADER: 'x-real-ip' });
+  try {
+    const supplier = await login('ar@volta.test', 'Supplier-password-1');
+    const session = (await request('GET', 'portal/session', undefined, supplier)).data;
+    assert.equal(session.mfa_enrolment_required, true);
+    assert.equal((await request('GET', 'portal/bootstrap', undefined, supplier)).status, 403);
+    const res = await handleRequest(new NextRequest('http://localhost:3000/api/portal/compliance/' + fx.anchorRef + '/screening', { method: 'POST', headers: { 'Content-Type': 'application/json', cookie: `invoix_token=${await login('checker@example.test')}`, 'x-real-ip': '196.200.10.7' }, body: JSON.stringify({ subject_type: 'organisation', subject_name: 'Acme Holdings Ltd', outcome: 'clear', reference: 'IP-TEST' }) }), ['portal', 'compliance', fx.anchorRef, 'screening']);
+    assert.equal(res.status, 403, 'operations must verify their own authenticator first');
+  } finally { delete process.env.REQUIRE_OPERATIONS_MFA; }
+  try {
+    const res = await handleRequest(new NextRequest('http://localhost:3000/api/portal/compliance/' + fx.anchorRef + '/screening', { method: 'POST', headers: { 'Content-Type': 'application/json', cookie: `invoix_token=${tokens.checker}`, 'x-real-ip': '196.200.10.7' }, body: JSON.stringify({ subject_type: 'organisation', subject_name: 'Acme Holdings Ltd', outcome: 'clear', reference: 'IP-TEST' }) }), ['portal', 'compliance', fx.anchorRef, 'screening']);
+    assert.equal(res.status, 201, await res.clone().text());
+    const [event] = await rows("SELECT ip FROM portal_events WHERE event='compliance.screened' ORDER BY id DESC LIMIT 1");
+    assert.equal(event.ip, '196.200.10.7');
+  } finally { delete process.env.CLIENT_IP_HEADER; }
 });

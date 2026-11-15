@@ -28,7 +28,7 @@ const supplierOwned='s.id,s.name,s.email,s.user_id,s.legal_name,s.trading_name,s
 const supplierPartner='s.id,s.name,s.email,s.user_id,s.legal_name,s.trading_name,s.registration_number,s.country,s.industry,s.contact_name,s.contact_title,s.contact_phone,s.website,s.preferred_currency,s.preferred_language,s.verification_status,s.created_at';
 async function bootstrap(actor:Actor){
  const session=await sessionData(actor);
- const notifications=await rows('SELECT id,subject,body,created_at,read_at,related_id FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT 250',[actor.id]);
+ const notifications=await rows("SELECT id,subject,body,created_at,read_at,related_id FROM notifications WHERE user_id=$1 AND coalesce(channel,'in_app')='in_app' ORDER BY id DESC LIMIT 250",[actor.id]);
  // Unverified or membership-less accounts see only their own onboarding material.
  if(actor.role!=='platform_ops'&&(session.needs_onboarding||actor.role==='buyer_admin'&&!actor.buyer_id)){
   const documents=await rows('SELECT id,buyer_id,supplier_id,invoice_id,file_name,category,size_bytes,created_at,uploaded_by,review_status,review_reason FROM documents WHERE archived_at IS NULL AND (uploaded_by=$1 OR on_behalf_of_user_id=$1)',[actor.id]);
@@ -98,7 +98,7 @@ export async function portalRequest(actor:Actor,method:string,path:string[],body
   await portalEvent(actor,'profile.updated',null,null,{},db);});return {data:await sessionData(actor)};
  }
  if(resource==='notifications'&&method==='POST'){
-  const data=z.object({id:id.optional()}).parse(body);await rows('UPDATE notifications SET read_at=now() WHERE user_id=$1 AND ($2::bigint IS NULL OR id=$2)',[actor.id,data.id??null]);return {data:{ok:true}};
+  const data=z.object({id:id.optional()}).parse(body);await rows("UPDATE notifications SET read_at=now() WHERE user_id=$1 AND coalesce(channel,'in_app')='in_app' AND ($2::bigint IS NULL OR id=$2)",[actor.id,data.id??null]);return {data:{ok:true}};
  }
  if(resource==='invoices'&&rawId&&method==='POST')return transaction(async db=>{
   const invoice=await ownedInvoice(actor,id.parse(rawId),db);

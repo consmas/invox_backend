@@ -1,6 +1,7 @@
 import { type Actor } from '../auth';
 import { rows, type DB } from '../db';
 import { requireCondition } from '../errors';
+import { requestIp } from '../portal-support';
 
 /**
  * Organisation status models from SRS Appendix B (§13.5.11 anchor, §13.7.10 funder, §13.6 supplier). Statuses are
@@ -47,16 +48,16 @@ export const EDITABLE_SETUP = ['SETUP_IN_PROGRESS', 'DOCUMENTATION_OUTSTANDING',
 /** Statuses from which an organisation's people may use the platform (legacy organisations are always active). */
 export const LIVE = ['ACTIVE'];
 
-export type Lifecycle = { org_ref: string; counterparty: Counterparty; status: string; legacy: boolean; tier: string; risk_rating: string | null; re_verification_due: string | null };
+export type Lifecycle = { org_ref: string; counterparty: Counterparty; status: string; legacy: boolean; tier: string; entity_type: string; relationship_manager_id: string | null; risk_rating: string | null; re_verification_due: string | null };
 export async function lifecycle(ref: string, db?: DB, lock = false): Promise<Lifecycle | null> {
   const [row] = await rows(`SELECT * FROM organisation_lifecycle WHERE org_ref=$1${lock ? ' FOR UPDATE' : ''}`, [ref], db);
   return (row as Lifecycle) ?? null;
 }
-export async function startLifecycle(ref: string, counterparty: Counterparty, status: string, actor: Actor | null, reason: string, db: DB) {
+export async function startLifecycle(ref: string, counterparty: Counterparty, status: string, actor: Actor | null, reason: string, db: DB, options: { entityType?: string; relationshipManagerId?: string | null } = {}) {
   // A supplier starts on the configured diligence tier (S2.1); anchors and funders follow the standard checklist.
   const [tier] = counterparty === 'SUPPLIER' ? await rows("SELECT value #>> '{}' AS tier FROM onboarding_settings WHERE key='supplier_default_tier'", [], db) : [];
-  await rows('INSERT INTO organisation_lifecycle(org_ref,counterparty,status,tier) VALUES($1,$2,$3,$4)', [ref, counterparty, status, tier?.tier ?? 'standard'], db);
-  await rows('INSERT INTO organisation_status_events(org_ref,previous_status,new_status,actor_id,reason) VALUES($1,NULL,$2,$3,$4)', [ref, status, actor?.id ?? null, reason], db);
+  await rows('INSERT INTO organisation_lifecycle(org_ref,counterparty,status,tier,entity_type,relationship_manager_id) VALUES($1,$2,$3,$4,$5,$6)', [ref, counterparty, status, tier?.tier ?? 'standard', options.entityType ?? 'limited_company', options.relationshipManagerId ?? null], db);
+  await rows('INSERT INTO organisation_status_events(org_ref,previous_status,new_status,actor_id,reason,ip) VALUES($1,NULL,$2,$3,$4,$5)', [ref, status, actor?.id ?? null, reason, requestIp()], db);
 }
 /** Moves an organisation along an allowed edge of its status model and audits the change. */
 export async function transition(ref: string, to: string, actor: Actor | null, reason: string, db: DB) {
@@ -65,7 +66,7 @@ export async function transition(ref: string, to: string, actor: Actor | null, r
   if (current.status === to) return current;
   requireCondition(EDGES[current.counterparty][current.status]?.includes(to), 409, `The organisation cannot move from ${label(current.status)} to ${label(to)}`);
   await rows('UPDATE organisation_lifecycle SET status=$2,updated_at=now() WHERE org_ref=$1', [ref, to], db);
-  await rows('INSERT INTO organisation_status_events(org_ref,previous_status,new_status,actor_id,reason) VALUES($1,$2,$3,$4,$5)', [ref, current.status, to, actor?.id ?? null, reason], db);
+  await rows('INSERT INTO organisation_status_events(org_ref,previous_status,new_status,actor_id,reason,ip) VALUES($1,$2,$3,$4,$5,$6)', [ref, current.status, to, actor?.id ?? null, reason, requestIp()], db);
   return { ...current, status: to };
 }
 export async function history(ref: string, db?: DB) {

@@ -23,6 +23,8 @@ async function mailer(): Promise<{ send: (message: { to: string; subject: string
   }
   return null;
 }
+/** Whether outgoing email can actually be delivered (saved SMTP settings or SMTP_URL). */
+export async function mailConfigured() { return !!(await mailer()); }
 export async function requireMailConfiguration() {
   if (process.env.NODE_ENV === 'production' && !(await activeIntegration('smtp')) && (!process.env.SMTP_URL || !process.env.MAIL_FROM)) {
     throw new ApiError(503, 'Email delivery is not configured');

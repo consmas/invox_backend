@@ -42,14 +42,14 @@ export async function authRequest(req: NextRequest, action: string, input: Recor
   }
   if (action === 'signup' && req.method === 'POST') {
     const data = z.object({ email, password, password_confirmation:z.string().optional(), role:z.string().default('buyer_admin'),
-      invite_token:z.string().optional(), name:z.string().optional(), registration_number:z.string().optional(), address:z.string().optional(),country:z.string().optional() }).parse(body);
+      invite_token:z.string().optional(), name:z.string().optional(), via:z.string().max(10).optional(), accept_terms:z.boolean().optional(), registration_number:z.string().optional(), address:z.string().optional(),country:z.string().optional() }).parse(body);
     requireCondition(!data.password_confirmation || data.password === data.password_confirmation, 422, 'Passwords do not match');
     // Only a supplier invited by its anchor signs up here; every other account is set up by invitation.
     requireCondition(data.invite_token, 403, 'INVOX accounts are set up by invitation. Contact us to onboard your organisation.');
     await rateLimit(`signup:${data.email}`, 5);
     const result = await transaction(async db => {
       requireCondition(data.role === 'supplier_user', 403, 'Invitation is for a supplier account');
-      const user = await registerInvitedSupplier({ email: data.email, password: data.password, token: data.invite_token!, name: data.name }, db);
+      const user = await registerInvitedSupplier({ email: data.email, password: data.password, token: data.invite_token!, name: data.name, via: data.via, accept_terms: data.accept_terms }, db);
       return { user:publicUser(user), token:await createSession(user, db) };
     });
     return withSession(NextResponse.json({ ok:true, user:result.user }, { status:201 }), result.token);

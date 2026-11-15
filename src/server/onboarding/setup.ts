@@ -9,6 +9,7 @@ import { entityAudit } from '../fields';
 import { isSuperAdmin } from '../act-for';
 import { type Counterparty, EDITABLE_SETUP, history, lifecycle, startLifecycle, transition } from './lifecycle';
 import { OPS_ROLES, OPS_ROLE_LABEL, opsRolesInput, requireOpsRole } from './roles';
+import { ENTITY_TYPES, checklistItems } from './checklist';
 
 /**
  * SRS stages A1 (anchor) and F1 (funder): Syndicate creates the organisation from executed off-system paperwork.
@@ -64,8 +65,11 @@ const createInput = z.object({
   counterparty: z.enum(['ANCHOR', 'FUNDER']),
   agreement: agreementInput,
   organisation: z.record(z.string(), z.unknown()),
+  entity_type: z.string().default('limited_company'),
   // A funder organisation is held by its relationship owner's account, provisioned here (F1.5) and never sent anything yet.
   relationship_owner: z.object({ name: text(200).min(2), email, job_title: optional(200) }).optional(),
+  // FR-JNY-F-003: a funder record cannot exist without its executed agreement and its mandatory due-diligence pack.
+  due_diligence: z.array(z.object({ item_key: text(100).min(1), document_id: id, issued_on: date.optional(), expires_on: date.optional() })).max(40).default([]),
 });
 
 async function claimDocuments(ref: string, ids: string[], db: DB, buyerId?: string) {
@@ -96,8 +100,16 @@ async function createOrganisation(actor: Actor, body: unknown) {
   const counterparty = input.counterparty;
   const org = (counterparty === 'ANCHOR' ? anchorInput : funderInput).parse(input.organisation) as z.infer<typeof anchorInput> & Partial<z.infer<typeof funderInput>>;
   if (counterparty === 'FUNDER') requireCondition(input.relationship_owner, 422, 'Name the funder’s relationship owner');
+  requireCondition(ENTITY_TYPES[counterparty].includes(input.entity_type), 422, 'Choose the entity type');
   return transaction(async db => {
     await requireOpsRole(actor, 'relationship_manager', db);
+    // The due-diligence pack must cover every mandatory item for this jurisdiction and entity type before the funder exists.
+    const pack = counterparty === 'FUNDER' ? await checklistItems('FUNDER', org.country, input.entity_type, 'standard', db) : [];
+    for (const item of pack) {
+      const filed = input.due_diligence.find(d => d.item_key === item.item_key);
+      requireCondition(filed, 422, `Attach the ${item.label.toLowerCase()} before creating the funder`);
+      requireCondition(!item.expires || (filed.expires_on && filed.expires_on >= today()), 422, `Enter a future expiry date for the ${item.label.toLowerCase()}`);
+    }
     const existing = await duplicate(org.country, org.registration_number, db);
     requireCondition(!existing, 409, `${existing?.name} is already on the platform with this registration number (${existing?.ref}). Open the existing record instead of creating a duplicate.`);
     let ref: string; let buyerId: string | undefined;
@@ -111,8 +123,8 @@ async function createOrganisation(actor: Actor, body: unknown) {
       const owner = input.relationship_owner!;
       const [taken] = await rows('SELECT id FROM users WHERE lower(email)=$1', [owner.email], db);
       requireCondition(!taken, 409, 'An account with the relationship owner’s email already exists');
-      const [user] = await rows(`INSERT INTO users(email,name,job_title,encrypted_password,role,jti,org_role,provisioning_status,created_at,updated_at)
-        VALUES($1,$2,$3,'!provisioned',3,$4,'relationship_owner','PROVISIONED_NOT_ACTIVATED',now(),now()) RETURNING id`, [owner.email, owner.name, owner.job_title, randomUUID()], db);
+      const [user] = await rows(`INSERT INTO users(email,name,job_title,encrypted_password,role,jti,org_role,provisioning_status,mfa_required,created_at,updated_at)
+        VALUES($1,$2,$3,'!provisioned',3,$4,'relationship_owner','PROVISIONED_NOT_ACTIVATED',true,now(),now()) RETURNING id`, [owner.email, owner.name, owner.job_title, randomUUID()], db);
       ref = `financier-${user.id}`;
       await rows('UPDATE users SET org_ref=$2 WHERE id=$1', [user.id, ref], db);
       await rows(`INSERT INTO financier_profiles(user_id,name,legal_name,trading_name,registration_number,country,industry,registered_address,operating_address,tax_id,funder_type,regulatory_status,licence_reference,tax_status,custodian_may_approve,institution_type,onboarding_status,verification_status)
@@ -123,7 +135,15 @@ async function createOrganisation(actor: Actor, body: unknown) {
     const documents = await claimDocuments(ref, agreement.document_ids, db, buyerId);
     await rows(`INSERT INTO executed_agreements(org_ref,kind,version,reference,executed_on,effective_on,expiry_on,document_ids,captured_by) VALUES($1,$2,1,$3,$4,$5,$6,$7,$8)`,
       [ref, counterparty === 'ANCHOR' ? 'commercial' : 'facility', agreement.reference, agreement.executed_on, agreement.effective_on ?? null, agreement.expiry_on ?? null, JSON.stringify(documents), actor.id], db);
-    await startLifecycle(ref, counterparty, 'SETUP_IN_PROGRESS', actor, `Set up from executed agreement ${agreement.reference}`, db);
+    await startLifecycle(ref, counterparty, 'SETUP_IN_PROGRESS', actor, `Set up from executed agreement ${agreement.reference}`, db, { entityType: input.entity_type, relationshipManagerId: actor.id });
+    if (pack.length) {
+      const years = Number((await rows("SELECT value FROM onboarding_settings WHERE key='document_retention_years'", [], db))[0]?.value ?? 7);
+      for (const filed of input.due_diligence.filter(d => pack.some(item => item.item_key === d.item_key))) {
+        await claimDocuments(ref, [filed.document_id], db);
+        await rows("UPDATE documents SET category=$2,retention_until=greatest(coalesce(retention_until,current_date),(current_date + make_interval(years => $3))::date) WHERE id=$1", [filed.document_id, filed.item_key, years], db);
+        await rows('INSERT INTO compliance_documents(org_ref,item_key,document_id,issued_on,expires_on,filed_by) VALUES($1,$2,$3,$4,$5,$6)', [ref, filed.item_key, filed.document_id, filed.issued_on ?? null, filed.expires_on ?? null, actor.id], db);
+      }
+    }
     await portalEvent(actor, 'organisation.setup_started', null, null, { org_ref: ref, record_id: ref, counterparty, agreement_reference: agreement.reference }, db);
     return { ref };
   });
@@ -193,8 +213,8 @@ async function provisionUser(actor: Actor, ref: string, body: unknown) {
     requireCondition(data.org_role === 'credit_officer' || data.approval_limit === null, 422, 'Approval authority applies to credit officers only');
     const [taken] = await rows('SELECT id FROM users WHERE lower(email)=$1', [data.email], db);
     requireCondition(!taken, 409, 'An account with this email already exists');
-    const [user] = await rows(`INSERT INTO users(email,name,job_title,contact_phone,encrypted_password,role,buyer_id,jti,org_ref,org_role,provisioning_status,approval_limit,created_at,updated_at)
-      VALUES($1,$2,$3,$4,'!provisioned',$5,$6,$7,$8,$9,'PROVISIONED_NOT_ACTIVATED',$10,now(),now()) RETURNING id`,
+    const [user] = await rows(`INSERT INTO users(email,name,job_title,contact_phone,encrypted_password,role,buyer_id,jti,org_ref,org_role,provisioning_status,approval_limit,mfa_required,created_at,updated_at)
+      VALUES($1,$2,$3,$4,'!provisioned',$5,$6,$7,$8,$9,'PROVISIONED_NOT_ACTIVATED',$10,true,now(),now()) RETURNING id`,
       [data.email, data.name, data.job_title, data.phone, org.counterparty === 'ANCHOR' ? 0 : 3, org.counterparty === 'ANCHOR' ? org.key : null, randomUUID(), ref, data.org_role, data.approval_limit], db);
     await portalEvent(actor, 'organisation.user_provisioned', null, null, { org_ref: ref, record_id: ref, user_id: user.id, org_role: data.org_role }, db);
     return { id: String(user.id) };
@@ -304,7 +324,7 @@ async function detail(ref: string) {
     ];
     const r = org.record;
     return {
-      ref, counterparty: org.counterparty, name: r.name, status: state?.status ?? 'ACTIVE', legacy: state?.legacy ?? true,
+      ref, counterparty: org.counterparty, name: r.name, status: state?.status ?? 'ACTIVE', legacy: state?.legacy ?? true, entity_type: state?.entity_type ?? null,
       profile: { legal_name: r.legal_name, trading_name: r.trading_name, country: r.country, registration_number: r.registration_number, sector: r.industry, registered_address: r.registered_address, trading_address: r.operating_address, tax_id: r.tax_id, erp_system: r.erp_system ?? null, funder_type: r.funder_type ?? null, regulatory_status: r.regulatory_status ?? null, licence_reference: r.licence_reference ?? null, tax_status: r.tax_status ?? null, custodian_may_approve: r.custodian_may_approve ?? null },
       agreements: agreements.map(a => ({ ...a, documents: documents.filter(d => (a.document_ids ?? []).map(String).includes(String(d.id))) })),
       users, signatories, contacts, setup_problems: setupProblems, history: await history(ref, db),
@@ -346,6 +366,13 @@ export async function setupRequest(actor: Actor, method: string, path: string[],
   if (!first && method === 'GET') return { data: await overview() };
   if (!first && method === 'POST') return { data: await createOrganisation(actor, body), status: 201 };
   if (first === 'team' && !second && method === 'GET') return { data: await team() };
+  // The checklist an organisation will need, before it exists (the funder's pack is attached at creation, F1.1/F-003).
+  if (first === 'checklist' && second && third && method === 'GET') {
+    const counterparty = z.enum(['ANCHOR', 'FUNDER']).parse(second);
+    const entity = z.string().regex(/^[a-z_]+$/).parse(path[5] ?? 'limited_company');
+    requireCondition(ENTITY_TYPES[counterparty].includes(entity), 422, 'Unknown entity type');
+    return { data: { entity_types: ENTITY_TYPES[counterparty], items: (await checklistItems(counterparty, String(third), entity, 'standard')).map(i => ({ key: i.item_key, label: i.label, guidance: i.guidance, expires: i.expires })) } };
+  }
   if (first === 'team' && second && third === 'roles' && method === 'PUT') return { data: await assignRoles(actor, id.parse(second), body) };
   const ref = String(first);
   if (!second && method === 'GET') return { data: await detail(ref) };
